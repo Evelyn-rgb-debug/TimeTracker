@@ -243,16 +243,17 @@ def ensure_windows_autostart():
         target = startup_script_path()
         if not target:
             return
+
         os.makedirs(os.path.dirname(target), exist_ok=True)
 
-        command = build_launch_command(tray_mode=True)
+        command = build_launch_command(tray_mode=True).replace('"', '""')
 
         content = 'Set WshShell = CreateObject("WScript.Shell")\r\n'
         content += f'WshShell.Run "{command}", 0, False\r\n'
 
         Path(target).write_text(content, encoding="utf-8")
-    except Exception:
-        pass
+    except Exception as e:
+        print("[AUTOSTART ERROR]", e)
 
 
 def apply_rounded_window_mask(widget, radius: int = 28):
