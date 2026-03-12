@@ -157,6 +157,8 @@ def fmt_hms(seconds: int) -> str:
 
 
 def script_dir() -> str:
+    if getattr(sys, "frozen", False):
+        return getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
     return os.path.abspath(os.path.dirname(__file__))
 
 
@@ -2682,7 +2684,7 @@ class MainWindow(QMainWindow):
         self.range_stats_scope_mode = StatsWidget.SCOPE_MONTH
 
         self.setWindowTitle(APP_NAME)
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window)
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window | Qt.WindowStaysOnBottomHint)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         icon_path = app_icon_path()
         if icon_path:
@@ -2700,13 +2702,41 @@ class MainWindow(QMainWindow):
         self._tick_timer.start()
 
         self.refresh_all()
-
+    def send_to_back(self):
+        try:
+            import ctypes
+            hwnd = int(self.winId())
+            HWND_BOTTOM = 1
+            SWP_NOSIZE = 0x0001
+            SWP_NOMOVE = 0x0002
+            SWP_NOACTIVATE = 0x0010
+            ctypes.windll.user32.SetWindowPos(
+                hwnd,
+                HWND_BOTTOM,
+                0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
+            )
+        except Exception as e:
+            print("[SEND_TO_BACK ERROR]", e)
+    def focusOutEvent(self, event):
+        super().focusOutEvent(event)
+        QTimer.singleShot(0, self.send_to_back)
+        QTimer.singleShot(80, self.send_to_back)
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QEvent.ActivationChange and not self.isActiveWindow():
+            QTimer.singleShot(0, self.send_to_back)
     def showEvent(self, e):
         super().showEvent(e)
         apply_rounded_window_mask(self, 34)
+
         if not self._win_style_applied:
             self._win_style_applied = True
             QTimer.singleShot(0, lambda: apply_windows_toolwindow_style(self))
+
+        QTimer.singleShot(0, self.send_to_back)
+        QTimer.singleShot(80, self.send_to_back)
+        QTimer.singleShot(200, self.send_to_back)
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
@@ -2825,6 +2855,7 @@ class MainWindow(QMainWindow):
         self.setWindowState(state)
         self.showNormal()
         self.show()
+        self.send_to_back()
         self.raise_()
         self.activateWindow()
         QTimer.singleShot(0, self.raise_)
