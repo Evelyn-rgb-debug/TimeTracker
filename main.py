@@ -1,0 +1,3332 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import json
+import math
+import os
+import random
+import sqlite3
+import sys
+import time
+import ctypes
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from pathlib import Path
+
+from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, Qt, QTimer, QDate, QDateTime, QTime, QEvent, QLocale
+from PySide6.QtGui import (
+    QColor,
+    QBrush,
+    QFont,
+    QIcon,
+    QImage,
+    QLinearGradient,
+    QPainter,
+    QPainterPath,
+    QPainterPathStroker,
+    QPen,
+    QPixmap,
+    QRadialGradient,
+    QRegion,
+)
+from PySide6.QtWidgets import (
+    QApplication,
+    QCalendarWidget,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QDateEdit,
+    QDateTimeEdit,
+    QHBoxLayout,
+    QHeaderView,
+    QAbstractItemView,
+    QLabel,
+    QMainWindow,
+    QMenu,
+    QMessageBox,
+    QPushButton,
+    QSizeGrip,
+    QSystemTrayIcon,
+    QTableWidget,
+    QTableWidgetItem,
+    QTextEdit,
+    QSpinBox,
+    QVBoxLayout,
+    QWidget,
+)
+
+APP_NAME = "Time Tracker :)"
+DEFAULT_CATEGORIES = ["Work", "Study", "Meal", "Fun", "Commute", "Exercise", "Rest", "Other"]
+DEFAULT_TASK_PLACEHOLDER = "(No details)"
+
+CATEGORY_ALIASES = {
+    "工作": "Work",
+    "学习": "Study",
+    "吃饭": "Meal",
+    "娱乐": "Fun",
+    "通勤": "Commute",
+    "运动": "Exercise",
+    "休息": "Rest",
+    "其他": "Other",
+    "Work": "Work",
+    "Study": "Study",
+    "Meal": "Meal",
+    "Fun": "Fun",
+    "Commute": "Commute",
+    "Exercise": "Exercise",
+    "Rest": "Rest",
+    "Other": "Other",
+}
+
+MINT = QColor(134, 231, 220)
+PURPLE = QColor(107, 113, 217)
+TEXT = QColor(33, 42, 60)
+SUBTEXT = QColor(90, 100, 120)
+WEEKEND = QColor(191, 132, 139)
+
+BASE_WIDTH = 1450.0
+BASE_HEIGHT = 860.0
+
+CALENDAR_GLASS_OPACITY_SCALE = 1.18
+
+
+def ui_scale_for(widget) -> float:
+    try:
+        win = widget.window() if widget is not None else None
+        if win is not None and hasattr(win, "ui_scale"):
+            return float(win.ui_scale())
+    except Exception:
+        pass
+    return 1.0
+
+
+def sp(widget, value: float, minimum: int = 1) -> int:
+    return max(int(minimum), int(round(float(value) * ui_scale_for(widget))))
+
+
+def ui_font(widget, size: float, weight: int = QFont.Normal) -> QFont:
+    return QFont("Segoe UI", max(1, int(round(float(size) * ui_scale_for(widget)))), weight)
+
+
+def try_enable_native_blur(widget):
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        hwnd = int(widget.winId())
+
+        class ACCENTPOLICY(ctypes.Structure):
+            _fields_ = [("AccentState", ctypes.c_int), ("AccentFlags", ctypes.c_int), ("GradientColor", ctypes.c_uint32), ("AnimationId", ctypes.c_int)]
+
+        class WINDOWCOMPOSITIONATTRIBDATA(ctypes.Structure):
+            _fields_ = [("Attribute", ctypes.c_int), ("Data", ctypes.c_void_p), ("SizeOfData", ctypes.c_size_t)]
+
+        # AccentState 3 = blur behind. Safer than acrylic across Windows versions.
+        accent = ACCENTPOLICY(3, 2, 0x20FFFFFF, 0)
+        data = WINDOWCOMPOSITIONATTRIBDATA(19, ctypes.addressof(accent), ctypes.sizeof(accent))
+        ctypes.windll.user32.SetWindowCompositionAttribute(hwnd, ctypes.byref(data))
+
+        class MARGINS(ctypes.Structure):
+            _fields_ = [("cxLeftWidth", ctypes.c_int), ("cxRightWidth", ctypes.c_int), ("cyTopHeight", ctypes.c_int), ("cyBottomHeight", ctypes.c_int)]
+
+        margins = MARGINS(-1, -1, -1, -1)
+        ctypes.windll.dwmapi.DwmExtendFrameIntoClientArea(hwnd, ctypes.byref(margins))
+    except Exception:
+        pass
+
+
+
+# ---------------- helpers ----------------
+def now_local() -> datetime:
+    return datetime.now()
+
+
+def dt_to_str(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def str_to_dt(s: str) -> datetime:
+    return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+
+
+def fmt_hms(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def script_dir() -> str:
+    return os.path.abspath(os.path.dirname(__file__))
+
+
+def app_icon_path() -> str:
+    p = os.path.join(script_dir(), "icon.png")
+    return p if os.path.exists(p) else ""
+
+
+def hide_windows_console():
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if hwnd:
+            ctypes.windll.user32.ShowWindow(hwnd, 0)
+    except Exception:
+        pass
+
+
+_SINGLE_INSTANCE_HANDLE = None
+
+
+def ensure_single_instance() -> bool:
+    global _SINGLE_INSTANCE_HANDLE
+    if not sys.platform.startswith("win"):
+        return True
+    try:
+        mutex_name = r"Local\TimeTrackerGlassSingleton"
+        _SINGLE_INSTANCE_HANDLE = ctypes.windll.kernel32.CreateMutexW(None, False, mutex_name)
+        already_exists = ctypes.windll.kernel32.GetLastError() == 183
+        return not already_exists
+    except Exception:
+        return True
+
+
+def apply_windows_toolwindow_style(widget):
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        hwnd = int(widget.winId())
+        GWL_EXSTYLE = -20
+        WS_EX_APPWINDOW = 0x00040000
+        WS_EX_TOOLWINDOW = 0x00000080
+        SWP_NOSIZE = 0x0001
+        SWP_NOMOVE = 0x0002
+        SWP_NOZORDER = 0x0004
+        SWP_FRAMECHANGED = 0x0020
+        ex_style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        ex_style = (ex_style & ~WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW
+        ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style)
+        ctypes.windll.user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED)
+    except Exception:
+        pass
+
+
+def startup_script_path() -> str:
+    base = os.environ.get("APPDATA") or ""
+    if not base:
+        return ""
+    return os.path.join(base, "Microsoft", "Windows", "Start Menu", "Programs", "Startup", "Time Tracker.vbs")
+
+
+def build_launch_command(tray_mode: bool = False) -> str:
+    args = []
+    if getattr(sys, "frozen", False):
+        args.append(f'"{sys.executable}"')
+    else:
+        py_exe = sys.executable
+        if tray_mode and py_exe.lower().endswith("python.exe"):
+            alt = py_exe[:-10] + "pythonw.exe"
+            if os.path.exists(alt):
+                py_exe = alt
+        args.append(f'"{py_exe}"')
+        args.append(f'"{os.path.abspath(__file__)}"')
+    if tray_mode:
+        args.append("--tray")
+    return " ".join(args)
+
+
+def ensure_windows_autostart():
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        target = startup_script_path()
+        if not target:
+            return
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+
+        command = build_launch_command(tray_mode=True)
+
+        content = 'Set WshShell = CreateObject("WScript.Shell")\r\n'
+        content += f'WshShell.Run "{command}", 0, False\r\n'
+
+        Path(target).write_text(content, encoding="utf-8")
+    except Exception:
+        pass
+
+
+def apply_rounded_window_mask(widget, radius: int = 28):
+    try:
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(widget.rect()), radius, radius)
+        region = QRegion(path.toFillPolygon().toPolygon())
+        widget.setMask(region)
+    except Exception:
+        pass
+
+
+def app_data_dir() -> str:
+    base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or ""
+    if base:
+        p = os.path.join(base, "TimeTrackerGlass")
+        os.makedirs(p, exist_ok=True)
+        return p
+    return os.path.abspath(os.path.dirname(__file__))
+
+
+def db_path() -> str:
+    return os.path.join(app_data_dir(), "tracker.db")
+
+
+def blend(c1: QColor, c2: QColor, t: float, alpha: int | None = None) -> QColor:
+    t = max(0.0, min(1.0, float(t)))
+    r = int(c1.red() + (c2.red() - c1.red()) * t)
+    g = int(c1.green() + (c2.green() - c1.green()) * t)
+    b = int(c1.blue() + (c2.blue() - c1.blue()) * t)
+    a = alpha if alpha is not None else int(c1.alpha() + (c2.alpha() - c1.alpha()) * t)
+    return QColor(r, g, b, a)
+
+
+def start_of_day(dt: datetime) -> datetime:
+    return dt.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def end_of_day(dt: datetime) -> datetime:
+    return dt.replace(hour=23, minute=59, second=59, microsecond=0)
+
+
+def clamp_item_to_range(item: dict, range_start: datetime, range_end: datetime) -> dict | None:
+    try:
+        item_start = str_to_dt(item["start"])
+        item_end = str_to_dt(item["end"])
+    except Exception:
+        return None
+    clip_start = max(item_start, range_start)
+    clip_end = min(item_end, range_end)
+    if clip_end <= clip_start:
+        return None
+    clipped = dict(item)
+    clipped["start"] = dt_to_str(clip_start)
+    clipped["end"] = dt_to_str(clip_end)
+    clipped["duration_sec"] = max(0, int((clip_end - clip_start).total_seconds()))
+    return clipped
+
+
+def week_start(dt: datetime) -> datetime:
+    return start_of_day(dt) - timedelta(days=dt.weekday())
+
+
+def month_start(dt: datetime) -> datetime:
+    return dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+
+def add_months(dt: datetime, delta: int) -> datetime:
+    y = dt.year + (dt.month - 1 + delta) // 12
+    m = (dt.month - 1 + delta) % 12 + 1
+    return dt.replace(year=y, month=m, day=1)
+
+
+def normalize_category(cat: str) -> str:
+    return CATEGORY_ALIASES.get(str(cat).strip(), "Other")
+
+
+def normalize_categories(items) -> list[str]:
+    out = []
+    seen = set()
+    for x in items or []:
+        n = normalize_category(x)
+        if n not in seen:
+            out.append(n)
+            seen.add(n)
+    return out or DEFAULT_CATEGORIES[:]
+
+
+def normalize_task_text(text_value: str) -> str:
+    s = str(text_value or "").strip()
+    return DEFAULT_TASK_PLACEHOLDER if s in {"", "(未填写)", DEFAULT_TASK_PLACEHOLDER} else s
+
+
+def aggregate_category_totals(items) -> tuple[list[tuple[str, int]], int, dict[str, int]]:
+    totals: dict[str, int] = {}
+    total = 0
+    for s in items or []:
+        sec = max(0, int(s.get("duration_sec", 0) or 0))
+        if sec <= 0:
+            continue
+        cat = normalize_category(s.get("category", "Other"))
+        totals[cat] = totals.get(cat, 0) + sec
+        total += sec
+    ordered = sorted(totals.items(), key=lambda x: x[1], reverse=True)
+    return ordered, total, totals
+
+
+# ---------------- noise texture ----------------
+_NOISE_PIXMAP: QPixmap | None = None
+
+
+def get_noise_pixmap() -> QPixmap:
+    global _NOISE_PIXMAP
+    if _NOISE_PIXMAP is not None:
+        return _NOISE_PIXMAP
+    w, h = 256, 256
+    img = QImage(w, h, QImage.Format_ARGB32)
+    rng = random.Random(20260306)
+    for y in range(h):
+        for x in range(w):
+            v = rng.randint(135, 175)
+            img.setPixelColor(x, y, QColor(v, v, v, 7))
+    _NOISE_PIXMAP = QPixmap.fromImage(img)
+    return _NOISE_PIXMAP
+
+
+# ---------------- DB ----------------
+class TrackerDB:
+    def __init__(self, path: str):
+        self.conn = sqlite3.connect(path)
+        self.conn.execute("PRAGMA journal_mode=WAL;")
+        self._init()
+
+    def _init(self):
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sessions(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                start_ts TEXT NOT NULL,
+                end_ts TEXT NOT NULL,
+                duration_sec INTEGER NOT NULL,
+                category TEXT NOT NULL,
+                task_text TEXT NOT NULL
+            );
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS app_state(
+                k TEXT PRIMARY KEY,
+                v TEXT NOT NULL
+            );
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS plans(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                start_ts TEXT NOT NULL,
+                end_ts TEXT NOT NULL,
+                category TEXT NOT NULL,
+                task_text TEXT NOT NULL
+            );
+            """
+        )
+        self.conn.commit()
+
+    def set_state(self, k: str, v: str):
+        self.conn.execute(
+            "INSERT INTO app_state(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v;",
+            (k, v),
+        )
+        self.conn.commit()
+
+    def get_state(self, k: str, default: str = "") -> str:
+        cur = self.conn.execute("SELECT v FROM app_state WHERE k=?;", (k,))
+        row = cur.fetchone()
+        return row[0] if row else default
+
+    def add_session(self, start_dt: datetime, end_dt: datetime, category: str, task_text: str):
+        dur = max(0, int((end_dt - start_dt).total_seconds()))
+        cur = self.conn.execute(
+            "INSERT INTO sessions(start_ts,end_ts,duration_sec,category,task_text) VALUES(?,?,?,?,?);",
+            (dt_to_str(start_dt), dt_to_str(end_dt), dur, category, task_text),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def update_session(self, sid: int, start_dt: datetime, end_dt: datetime, category: str, task_text: str):
+        dur = max(0, int((end_dt - start_dt).total_seconds()))
+        self.conn.execute(
+            "UPDATE sessions SET start_ts=?, end_ts=?, duration_sec=?, category=?, task_text=? WHERE id=?;",
+            (dt_to_str(start_dt), dt_to_str(end_dt), dur, category, task_text, sid),
+        )
+        self.conn.commit()
+
+    def delete_session(self, sid: int):
+        self.conn.execute("DELETE FROM sessions WHERE id=?;", (sid,))
+        self.conn.commit()
+
+    def get_session_by_id(self, sid: int):
+        cur = self.conn.execute(
+            "SELECT id,start_ts,end_ts,category,task_text FROM sessions WHERE id=?;",
+            (sid,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            "id": int(row[0]),
+            "start": row[1],
+            "end": row[2],
+            "category": row[3],
+            "task_text": row[4],
+        }
+
+    def get_sessions_in_range(self, start_dt: datetime, end_dt: datetime):
+        cur = self.conn.execute(
+            "SELECT id,start_ts,end_ts,duration_sec,category,task_text FROM sessions WHERE start_ts <= ? AND end_ts >= ? ORDER BY start_ts ASC;",
+            (dt_to_str(end_dt), dt_to_str(start_dt)),
+        )
+        rows = cur.fetchall()
+        return [
+            {
+                "id": int(r[0]),
+                "start": r[1],
+                "end": r[2],
+                "duration_sec": int(r[3]),
+                "category": r[4],
+                "task_text": r[5],
+            }
+            for r in rows
+        ]
+
+    def add_plan(self, start_dt: datetime, end_dt: datetime, category: str, task_text: str):
+        cur = self.conn.execute(
+            "INSERT INTO plans(start_ts,end_ts,category,task_text) VALUES(?,?,?,?);",
+            (dt_to_str(start_dt), dt_to_str(end_dt), category, task_text),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def update_plan(self, pid: int, start_dt: datetime, end_dt: datetime, category: str, task_text: str):
+        self.conn.execute(
+            "UPDATE plans SET start_ts=?, end_ts=?, category=?, task_text=? WHERE id=?;",
+            (dt_to_str(start_dt), dt_to_str(end_dt), category, task_text, pid),
+        )
+        self.conn.commit()
+
+    def delete_plan(self, pid: int):
+        self.conn.execute("DELETE FROM plans WHERE id=?;", (pid,))
+        self.conn.commit()
+
+    def get_plan_by_id(self, pid: int):
+        cur = self.conn.execute(
+            "SELECT id,start_ts,end_ts,category,task_text FROM plans WHERE id=?;",
+            (pid,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            "id": int(row[0]),
+            "start": row[1],
+            "end": row[2],
+            "category": row[3],
+            "task_text": row[4],
+        }
+
+    def get_plans_in_range(self, start_dt: datetime, end_dt: datetime):
+        cur = self.conn.execute(
+            "SELECT id,start_ts,end_ts,category,task_text FROM plans WHERE start_ts <= ? AND end_ts >= ? ORDER BY start_ts ASC;",
+            (dt_to_str(end_dt), dt_to_str(start_dt)),
+        )
+        rows = cur.fetchall()
+        return [
+            {
+                "id": int(r[0]),
+                "start": r[1],
+                "end": r[2],
+                "duration_sec": max(0, int((str_to_dt(r[2]) - str_to_dt(r[1])).total_seconds())),
+                "category": r[3],
+                "task_text": r[4],
+            }
+            for r in rows
+        ]
+
+    def close(self):
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+
+
+CAT_COLORS = {
+    "Work": blend(MINT, PURPLE, 0.00),
+    "Study": blend(MINT, PURPLE, 0.14),
+    "Meal": blend(MINT, PURPLE, 0.28),
+    "Fun": blend(MINT, PURPLE, 0.42),
+    "Commute": blend(MINT, PURPLE, 0.58),
+    "Exercise": blend(MINT, PURPLE, 0.72),
+    "Rest": blend(MINT, PURPLE, 0.86),
+    "Other": blend(MINT, PURPLE, 1.00),
+}
+
+
+def color_for_category(cat: str) -> QColor:
+    return CAT_COLORS.get(normalize_category(cat), blend(MINT, PURPLE, 0.5))
+
+
+
+# ---------------- background ----------------
+class LightWallpaperBackground(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
+        if r.width() <= 10 or r.height() <= 10:
+            return
+
+        outer = QPainterPath()
+        outer.addRoundedRect(r, 38, 38)
+        # keep the thick glass edge mostly near the outside so the inner white plate stays large
+        rim1_r = r.adjusted(5, 5, -5, -5)
+        rim1 = QPainterPath()
+        rim1.addRoundedRect(rim1_r, 34, 34)
+        rim2_r = r.adjusted(10, 10, -10, -10)
+        rim2 = QPainterPath()
+        rim2.addRoundedRect(rim2_r, 30, 30)
+        panel_r = r.adjusted(16, 16, -16, -16)
+        panel = QPainterPath()
+        panel.addRoundedRect(panel_r, 24, 24)
+
+        band_outer = outer.subtracted(rim1)
+        band_mid = rim1.subtracted(rim2)
+        band_inner = rim2.subtracted(panel)
+
+        # very thick outer glass edge
+        g_outer = QLinearGradient(r.topLeft(), r.bottomRight())
+        g_outer.setColorAt(0.00, QColor(255, 255, 255, 220))
+        g_outer.setColorAt(0.14, QColor(255, 255, 255, 138))
+        g_outer.setColorAt(0.55, QColor(255, 255, 255, 82))
+        g_outer.setColorAt(1.00, QColor(255, 255, 255, 190))
+        p.fillPath(band_outer, g_outer)
+
+        g_mid = QLinearGradient(r.topLeft(), r.bottomRight())
+        g_mid.setColorAt(0.00, QColor(255, 255, 255, 120))
+        g_mid.setColorAt(0.36, QColor(210, 238, 236, 66))
+        g_mid.setColorAt(0.74, QColor(205, 210, 246, 52))
+        g_mid.setColorAt(1.00, QColor(255, 255, 255, 96))
+        p.fillPath(band_mid, g_mid)
+
+        g_inner = QLinearGradient(r.topLeft(), r.bottomRight())
+        g_inner.setColorAt(0.00, QColor(255, 255, 255, 58))
+        g_inner.setColorAt(0.50, QColor(255, 255, 255, 22))
+        g_inner.setColorAt(1.00, QColor(255, 255, 255, 42))
+        p.fillPath(band_inner, g_inner)
+
+        fill = QLinearGradient(panel_r.topLeft(), panel_r.bottomRight())
+        fill.setColorAt(0.0, QColor(248, 251, 252, 148))
+        fill.setColorAt(0.45, QColor(245, 249, 251, 132))
+        fill.setColorAt(1.0, QColor(249, 247, 252, 142))
+        p.fillPath(panel, fill)
+
+        p.save()
+        p.setClipPath(outer)
+
+        blobs = [
+            (QPointF(r.left() + r.width() * 0.08, r.top() + r.height() * 0.18), min(r.width(), r.height()) * 0.26, QColor(MINT.red(), MINT.green(), MINT.blue(), 36)),
+            (QPointF(r.right() - r.width() * 0.10, r.top() + r.height() * 0.22), min(r.width(), r.height()) * 0.24, QColor(PURPLE.red(), PURPLE.green(), PURPLE.blue(), 34)),
+            (QPointF(r.left() + r.width() * 0.16, r.bottom() - r.height() * 0.10), min(r.width(), r.height()) * 0.28, QColor(MINT.red(), MINT.green(), MINT.blue(), 28)),
+            (QPointF(r.right() - r.width() * 0.12, r.bottom() - r.height() * 0.12), min(r.width(), r.height()) * 0.26, QColor(PURPLE.red(), PURPLE.green(), PURPLE.blue(), 26)),
+            (QPointF(r.left() + r.width() * 0.52, r.bottom() - r.height() * 0.04), min(r.width(), r.height()) * 0.22, QColor(255, 255, 255, 34)),
+        ]
+        p.setCompositionMode(QPainter.CompositionMode_Screen)
+        for center, rad, col in blobs:
+            g = QRadialGradient(center, rad)
+            g.setColorAt(0.0, col)
+            g.setColorAt(0.55, QColor(col.red(), col.green(), col.blue(), int(col.alpha() * 0.16)))
+            g.setColorAt(1.0, QColor(col.red(), col.green(), col.blue(), 0))
+            p.setPen(Qt.NoPen)
+            p.setBrush(g)
+            p.drawEllipse(center, rad, rad)
+        p.setCompositionMode(QPainter.CompositionMode_SourceOver)
+
+        top_gloss = QLinearGradient(r.left(), r.top(), r.left(), r.top() + r.height() * 0.34)
+        top_gloss.setColorAt(0.00, QColor(255, 255, 255, 108))
+        top_gloss.setColorAt(0.30, QColor(255, 255, 255, 28))
+        top_gloss.setColorAt(1.00, QColor(255, 255, 255, 0))
+        p.fillRect(r.toRect(), top_gloss)
+
+        # refractive bright rails near edges
+        p.setPen(QPen(QColor(255, 255, 255, 228), 1.6))
+        p.drawRoundedRect(r.adjusted(1, 1, -1, -1), 36, 36)
+        p.setPen(QPen(QColor(255, 255, 255, 116), 1.1))
+        p.drawRoundedRect(r.adjusted(6, 6, -6, -6), 32, 32)
+        p.setPen(QPen(QColor(MINT.red(), MINT.green(), MINT.blue(), 46), 1.0))
+        p.drawLine(int(r.left() + 18), int(r.bottom() - 28), int(r.left() + r.width() * 0.36), int(r.bottom() - 28))
+        p.setPen(QPen(QColor(PURPLE.red(), PURPLE.green(), PURPLE.blue(), 42), 1.0))
+        p.drawLine(int(r.right() - r.width() * 0.28), int(r.top() + 24), int(r.right() - 24), int(r.top() + 24))
+
+        p.setOpacity(0.014)
+        noise = get_noise_pixmap()
+        for yy in range(int(r.top()), int(r.bottom()), noise.height()):
+            for xx in range(int(r.left()), int(r.right()), noise.width()):
+                p.drawPixmap(xx, yy, noise)
+        p.restore()
+
+
+# ---------------- glass card ----------------
+class LightGlassCard(QWidget):
+    def __init__(self, radius: int = 30, parent=None):
+        super().__init__(parent)
+        self.radius = radius
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        r = QRectF(self.rect()).adjusted(4, 4, -4, -4)
+        if r.width() <= 10 or r.height() <= 10:
+            return
+
+        shadow_path = QPainterPath()
+        shadow_path.addRoundedRect(QRectF(r.adjusted(0, 11, 0, 14)), self.radius, self.radius)
+        p.fillPath(shadow_path, QColor(0, 0, 0, 18))
+
+        outer = QPainterPath()
+        outer.addRoundedRect(r, self.radius, self.radius)
+        rim_outer_r = r.adjusted(6, 6, -6, -6)
+        rim_outer = QPainterPath()
+        rim_outer.addRoundedRect(rim_outer_r, max(8, self.radius - 5), max(8, self.radius - 5))
+        rim_mid_r = r.adjusted(11, 11, -11, -11)
+        rim_mid = QPainterPath()
+        rim_mid.addRoundedRect(rim_mid_r, max(8, self.radius - 10), max(8, self.radius - 10))
+        panel_r = r.adjusted(16, 16, -16, -16)
+        panel = QPainterPath()
+        panel.addRoundedRect(panel_r, max(8, self.radius - 15), max(8, self.radius - 15))
+
+        band_outer = outer.subtracted(rim_outer)
+        band_mid = rim_outer.subtracted(rim_mid)
+        band_inner = rim_mid.subtracted(panel)
+
+        g_outer = QLinearGradient(r.topLeft(), r.bottomRight())
+        g_outer.setColorAt(0.00, QColor(255, 255, 255, 205))
+        g_outer.setColorAt(0.18, QColor(255, 255, 255, 118))
+        g_outer.setColorAt(0.52, QColor(255, 255, 255, 72))
+        g_outer.setColorAt(1.00, QColor(255, 255, 255, 170))
+        p.fillPath(band_outer, g_outer)
+
+        g_mid = QLinearGradient(r.topLeft(), r.bottomRight())
+        g_mid.setColorAt(0.00, QColor(255, 255, 255, 92))
+        g_mid.setColorAt(0.55, QColor(255, 255, 255, 34))
+        g_mid.setColorAt(1.00, QColor(255, 255, 255, 70))
+        p.fillPath(band_mid, g_mid)
+
+        g_inner = QLinearGradient(r.topLeft(), r.bottomRight())
+        g_inner.setColorAt(0.00, QColor(255, 255, 255, 50))
+        g_inner.setColorAt(1.00, QColor(255, 255, 255, 18))
+        p.fillPath(band_inner, g_inner)
+
+        fill = QLinearGradient(panel_r.topLeft(), panel_r.bottomRight())
+        fill.setColorAt(0.00, QColor(255, 255, 255, 132))
+        fill.setColorAt(0.35, QColor(255, 255, 255, 96))
+        fill.setColorAt(1.00, QColor(255, 255, 255, 82))
+        p.fillPath(panel, fill)
+
+        clip = QPainterPath()
+        clip.addRoundedRect(r, self.radius, self.radius)
+        p.save()
+        p.setClipPath(clip)
+
+        top_glow = QLinearGradient(r.left(), r.top(), r.left(), r.top() + r.height() * 0.46)
+        top_glow.setColorAt(0.0, QColor(255, 255, 255, 176))
+        top_glow.setColorAt(0.28, QColor(255, 255, 255, 58))
+        top_glow.setColorAt(1.0, QColor(255, 255, 255, 0))
+        p.fillRect(r.toRect(), top_glow)
+
+        lower_pool = QLinearGradient(r.left(), r.bottom(), r.right(), r.top())
+        lower_pool.setColorAt(0.0, QColor(MINT.red(), MINT.green(), MINT.blue(), 28))
+        lower_pool.setColorAt(0.5, QColor(255, 255, 255, 0))
+        lower_pool.setColorAt(1.0, QColor(PURPLE.red(), PURPLE.green(), PURPLE.blue(), 24))
+        p.fillRect(r.toRect(), lower_pool)
+
+        edge_lights = [
+            (QPointF(r.left() + r.width() * 0.10, r.bottom() - r.height() * 0.10), QColor(MINT.red(), MINT.green(), MINT.blue(), 66), r.width() * 0.20),
+            (QPointF(r.right() - r.width() * 0.12, r.top() + r.height() * 0.12), QColor(PURPLE.red(), PURPLE.green(), PURPLE.blue(), 58), r.width() * 0.18),
+            (QPointF(r.right() - r.width() * 0.10, r.bottom() - r.height() * 0.10), QColor(PURPLE.red(), PURPLE.green(), PURPLE.blue(), 40), r.width() * 0.18),
+            (QPointF(r.left() + r.width() * 0.52, r.bottom() - r.height() * 0.04), QColor(255, 255, 255, 44), r.width() * 0.22),
+        ]
+        p.setCompositionMode(QPainter.CompositionMode_Screen)
+        for center, col, rad in edge_lights:
+            g = QRadialGradient(center, rad)
+            g.setColorAt(0.0, col)
+            g.setColorAt(0.50, QColor(col.red(), col.green(), col.blue(), int(col.alpha() * 0.18)))
+            g.setColorAt(1.0, QColor(col.red(), col.green(), col.blue(), 0))
+            p.setBrush(g)
+            p.setPen(Qt.NoPen)
+            p.drawEllipse(center, rad, rad)
+        p.setCompositionMode(QPainter.CompositionMode_SourceOver)
+
+        p.setPen(QPen(QColor(255, 255, 255, 138), 1.2))
+        p.drawLine(QPointF(panel_r.left() + 18, panel_r.top() + 4), QPointF(panel_r.right() - 20, panel_r.top() + 4))
+        p.setPen(QPen(QColor(255, 255, 255, 62), 1.0))
+        p.drawLine(QPointF(panel_r.left() + 4, panel_r.top() + 18), QPointF(panel_r.left() + 4, panel_r.bottom() - 20))
+        p.setPen(QPen(QColor(255, 255, 255, 48), 1.0))
+        p.drawLine(QPointF(panel_r.left() + 28, panel_r.bottom() - 6), QPointF(panel_r.right() - 28, panel_r.bottom() - 6))
+
+        p.setOpacity(0.014)
+        noise = get_noise_pixmap()
+        for yy in range(int(r.top()), int(r.bottom()), noise.height()):
+            for xx in range(int(r.left()), int(r.right()), noise.width()):
+                p.drawPixmap(xx, yy, noise)
+        p.restore()
+
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(QColor(255, 255, 255, 238), 1.45))
+        p.drawRoundedRect(r, self.radius, self.radius)
+        p.setPen(QPen(QColor(255, 255, 255, 110), 1.0))
+        p.drawRoundedRect(r.adjusted(4, 4, -4, -4), self.radius - 3, self.radius - 3)
+        p.setPen(QPen(QColor(170, 195, 255, 26), 0.9))
+        p.drawRoundedRect(panel_r.adjusted(1, 1, -1, -1), max(8, self.radius - 16), max(8, self.radius - 16))
+
+
+# ---------------- shared button styles ----------------
+def glass_button_style(active: bool = False) -> str:
+    if active:
+        bg0 = f"rgba({MINT.red()},{MINT.green()},{MINT.blue()},160)"
+        bg1 = f"rgba({PURPLE.red()},{PURPLE.green()},{PURPLE.blue()},145)"
+        border = "rgba(255,255,255,220)"
+    else:
+        bg0 = "rgba(255,255,255,136)"
+        bg1 = "rgba(255,255,255,88)"
+        border = "rgba(255,255,255,200)"
+    return f'''
+        QPushButton{{
+            background:qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 {bg0}, stop:1 {bg1});
+            color:rgba(28,38,55,235);
+            border:1px solid {border};
+            border-radius:14px;
+            padding:8px 14px;
+            font-weight:800;
+        }}
+        QPushButton:hover{{border:1px solid rgba(255,255,255,235);}}
+        QPushButton:pressed{{background:rgba(255,255,255,145);}}
+    '''
+def glass_tiny_button_style(active: bool = False) -> str:
+    if active:
+        bg0 = f"rgba({MINT.red()},{MINT.green()},{MINT.blue()},160)"
+        bg1 = f"rgba({PURPLE.red()},{PURPLE.green()},{PURPLE.blue()},145)"
+        border = "rgba(255,255,255,220)"
+    else:
+        bg0 = "rgba(255,255,255,136)"
+        bg1 = "rgba(255,255,255,88)"
+        border = "rgba(255,255,255,200)"
+    return f'''
+        QPushButton{{
+            background:qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 {bg0}, stop:1 {bg1});
+            color:rgba(28,38,55,235);
+            border:1px solid {border};
+            border-radius:12px;
+            padding:0px 6px;
+            font-weight:800;
+            font-size:9px;
+        }}
+        QPushButton:hover{{border:1px solid rgba(255,255,255,235);}}
+        QPushButton:pressed{{background:rgba(255,255,255,145);}}
+    '''
+
+# ---------------- timer widget ----------------
+class TimerWidget(LightGlassCard):
+    def __init__(self, parent=None):
+        super().__init__(radius=30, parent=parent)
+        self.running = False
+        self.elapsed_sec = 0
+        self._anim = 0.0
+        self.on_start = None
+        self.on_stop = None
+
+        self.btn = QPushButton("Start", self)
+        self.btn.setCursor(Qt.PointingHandCursor)
+        self.btn.setStyleSheet(glass_button_style())
+        self.btn.clicked.connect(self._on_button)
+
+        self._tick = QTimer(self)
+        self._tick.setInterval(40)
+        self._tick.timeout.connect(self._animate)
+        self._tick.start()
+
+    def _animate(self):
+        self._anim = (self._anim + 1.0) % 360.0
+        self.update()
+
+    def resizeEvent(self, e):
+        bw = min(sp(self, 300), max(sp(self, 180), int(self.width() * 0.52)))
+        self.btn.setGeometry((self.width() - bw) // 2, self.height() - sp(self, 82), bw, sp(self, 54))
+        super().resizeEvent(e)
+
+    def _on_button(self):
+        if self.running:
+            if self.on_stop:
+                self.on_stop()
+        else:
+            if self.on_start:
+                self.on_start()
+
+    def set_running(self, running: bool):
+        self.running = running
+        self.btn.setText("Log" if running else "Start")
+        self.btn.setStyleSheet(glass_button_style(active=running))
+
+    def set_elapsed(self, sec: int):
+        self.elapsed_sec = max(0, int(sec))
+        self.update()
+
+    def paintEvent(self, e):
+        super().paintEvent(e)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        r = self.rect().adjusted(18, 18, -18, -18)
+        p.setPen(TEXT)
+        p.setFont(ui_font(self, 12, QFont.Bold))
+        p.drawText(QRectF(r.left(), r.top(), r.width(), 24), Qt.AlignLeft | Qt.AlignVCenter, "Timer")
+
+        cx = r.center().x()
+        cy = r.top() + r.height() * 0.42
+        radius = min(r.width(), r.height()) * 0.22
+        arc_rect = QRectF(cx - radius, cy - radius, radius * 2, radius * 2)
+        a0 = self._anim
+
+        p.setPen(QPen(QColor(MINT.red(), MINT.green(), MINT.blue(), 54), 18, Qt.SolidLine, Qt.RoundCap))
+        p.drawArc(arc_rect, int((-a0) * 16), int(124 * 16))
+        p.setPen(QPen(QColor(PURPLE.red(), PURPLE.green(), PURPLE.blue(), 48), 18, Qt.SolidLine, Qt.RoundCap))
+        p.drawArc(arc_rect, int((-(a0 + 146)) * 16), int(124 * 16))
+
+        p.setPen(QPen(QColor(MINT.red(), MINT.green(), MINT.blue(), 220), 7, Qt.SolidLine, Qt.RoundCap))
+        p.drawArc(arc_rect, int((-a0) * 16), int(124 * 16))
+        p.setPen(QPen(QColor(PURPLE.red(), PURPLE.green(), PURPLE.blue(), 215), 7, Qt.SolidLine, Qt.RoundCap))
+        p.drawArc(arc_rect, int((-(a0 + 146)) * 16), int(124 * 16))
+
+        p.setPen(QPen(QColor(255, 255, 255, 112), 2, Qt.SolidLine, Qt.RoundCap))
+        p.drawArc(arc_rect.adjusted(4, 4, -4, -4), int((-(a0 + 14)) * 16), int(96 * 16))
+
+        tr = QRectF(cx - 170, cy - 28, 340, 56)
+        f = ui_font(self, 25, QFont.Black)
+        f.setLetterSpacing(QFont.AbsoluteSpacing, 1.0)
+        p.setFont(f)
+        p.setPen(QColor(TEXT.red(), TEXT.green(), TEXT.blue(), 235))
+        p.drawText(tr, Qt.AlignCenter, fmt_hms(self.elapsed_sec))
+
+
+# ---------------- stats widget ----------------
+# ---------------- stats widget ----------------
+class StatsWidget(LightGlassCard):
+    VIEW_DAY = "day"
+    VIEW_SUMMARY = "summary"
+    SCOPE_DAY = "day"
+    SCOPE_WEEK = "week"
+    SCOPE_MONTH = "month"
+
+    def __init__(self, parent=None):
+        super().__init__(radius=30, parent=parent)
+        self.items = []
+        self.summary_items = []
+        self.selected_date = start_of_day(now_local())
+        self.summary_anchor_date = self.selected_date
+        self.view_mode = self.VIEW_DAY
+        self.summary_scope_mode = self.SCOPE_MONTH
+        self.on_summary_scope_changed = None
+        self.hovered_cat: str | None = None
+        self._segment_meta: list[dict] = []
+        self._ring_center = QPointF(0.0, 0.0)
+        self._ring_inner_radius = 0.0
+        self._ring_outer_radius = 0.0
+        self._controls_left = 0
+        self.setMouseTracking(True)
+
+        self.btn_summary_toggle = QPushButton("Work Summary", self)
+        self.btn_summary_toggle.setCursor(Qt.PointingHandCursor)
+        self.btn_summary_toggle.clicked.connect(self._toggle_summary_view)
+
+        self.btn_day_scope = QPushButton("Day", self)
+        self.btn_week_scope = QPushButton("Week", self)
+        self.btn_month_scope = QPushButton("Month", self)
+        self._scope_buttons = {
+            self.SCOPE_DAY: self.btn_day_scope,
+            self.SCOPE_WEEK: self.btn_week_scope,
+            self.SCOPE_MONTH: self.btn_month_scope,
+        }
+        for mode, btn in self._scope_buttons.items():
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.clicked.connect(lambda checked=False, m=mode: self.set_summary_scope_mode(m, emit=True))
+
+        self._sync_controls()
+
+    def _compact_button_style(self, active: bool = False) -> str:
+        if active:
+            bg0 = f"rgba({MINT.red()},{MINT.green()},{MINT.blue()},160)"
+            bg1 = f"rgba({PURPLE.red()},{PURPLE.green()},{PURPLE.blue()},145)"
+            border = "rgba(255,255,255,220)"
+        else:
+            bg0 = "rgba(255,255,255,126)"
+            bg1 = "rgba(255,255,255,82)"
+            border = "rgba(255,255,255,192)"
+        return f"""
+            QPushButton{{
+                background:qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 {bg0}, stop:1 {bg1});
+                color:rgba(28,38,55,235);
+                border:1px solid {border};
+                border-radius:10px;
+                padding:0px 6px;
+                font-size:9px;
+                font-weight:800;
+            }}
+            QPushButton:hover{{border:1px solid rgba(255,255,255,232);}}
+            QPushButton:pressed{{background:rgba(255,255,255,145);}}
+        """
+
+    def _layout_controls(self):
+        margin_x = sp(self, 14)
+
+        # 标题单独占第一行，按钮放到下面一行
+        title_top = sp(self, 12)
+        title_h = sp(self, 24)
+        top_y = title_top + title_h + sp(self, 6)
+
+        btn_h = sp(self, 20)
+        gap = sp(self, 4)
+
+        # 尽量小一点，但保证能装下文字
+        toggle_w = sp(self, 70 if self.view_mode == self.VIEW_SUMMARY else 98)
+        scope_w = sp(self, 40)
+        scope_month_w = sp(self, 50)
+
+        right_x = self.width() - margin_x - toggle_w
+        self.btn_summary_toggle.setGeometry(right_x, top_y, toggle_w, btn_h)
+
+        x = right_x - gap
+        if self.view_mode == self.VIEW_SUMMARY:
+            for mode in (self.SCOPE_MONTH, self.SCOPE_WEEK, self.SCOPE_DAY):
+                btn = self._scope_buttons[mode]
+                w = scope_month_w if mode == self.SCOPE_MONTH else scope_w
+                x -= w
+                btn.setGeometry(x, top_y, w, btn_h)
+                x -= gap
+            self._controls_left = x + gap
+        else:
+            self._controls_left = right_x
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._layout_controls()
+
+    def _toggle_summary_view(self):
+        self.set_summary_visible(self.view_mode != self.VIEW_SUMMARY)
+
+    def set_summary_visible(self, visible: bool):
+        self.view_mode = self.VIEW_SUMMARY if visible else self.VIEW_DAY
+        self.hovered_cat = None
+        self._sync_controls()
+
+    def _sync_controls(self):
+        summary_open = self.view_mode == self.VIEW_SUMMARY
+        self.btn_summary_toggle.setText("Back" if summary_open else "Work Summary")
+        self.btn_summary_toggle.setStyleSheet(self._compact_button_style(active=summary_open))
+        for mode, btn in self._scope_buttons.items():
+            btn.setVisible(summary_open)
+            btn.setStyleSheet(self._compact_button_style(active=(summary_open and mode == self.summary_scope_mode)))
+        self._layout_controls()
+        self.updateGeometry()
+        self.update()
+
+    def set_day_items(self, day_dt: datetime, items):
+        self.selected_date = start_of_day(day_dt)
+        self.items = list(items or [])
+        self.hovered_cat = None
+        self.update()
+
+    def set_summary_items(self, anchor_dt: datetime, items):
+        self.summary_anchor_date = start_of_day(anchor_dt)
+        self.summary_items = list(items or [])
+        self.hovered_cat = None
+        self.update()
+
+    def set_summary_scope_mode(self, mode: str, emit: bool = False):
+        if mode not in (self.SCOPE_DAY, self.SCOPE_WEEK, self.SCOPE_MONTH):
+            mode = self.SCOPE_MONTH
+        self.summary_scope_mode = mode
+        self.hovered_cat = None
+        self._sync_controls()
+        if emit and self.on_summary_scope_changed:
+            self.on_summary_scope_changed(self.summary_scope_mode)
+
+    def set_sessions(self, sessions):
+        self.set_day_items(self.selected_date, sessions)
+
+    def _summary_period_text(self) -> str:
+        if self.summary_scope_mode == self.SCOPE_DAY:
+            return self.summary_anchor_date.strftime("%Y-%m-%d")
+        if self.summary_scope_mode == self.SCOPE_WEEK:
+            st = week_start(self.summary_anchor_date)
+            ed = st + timedelta(days=6)
+            return f"{st.strftime('%Y-%m-%d')}  ~  {ed.strftime('%m-%d')}"
+        return month_start(self.summary_anchor_date).strftime("%Y-%m")
+
+    def _active_title(self) -> str:
+        if self.view_mode == self.VIEW_SUMMARY:
+            return "Work Summary"
+        return f"Stats  ·  {self.selected_date.strftime('%Y-%m-%d')}"
+
+    def _active_items(self):
+        return self.summary_items if self.view_mode == self.VIEW_SUMMARY else self.items
+
+    def _default_center_sub(self) -> str:
+        if self.view_mode == self.VIEW_SUMMARY:
+            return ""
+        return "Recorded Today"
+
+    @staticmethod
+    def _norm_angle(deg_value: float) -> float:
+        return deg_value % 360.0
+    @staticmethod
+    def _angle_delta(a: float, b: float) -> float:
+        return abs((a - b + 180.0) % 360.0 - 180.0)
+
+    def _distance_to_arc_centerline(self, point: QPointF, seg: dict) -> float:
+        px = float(point.x())
+        py = float(point.y())
+        cx = float(self._ring_center.x())
+        cy = float(self._ring_center.y())
+        radius = float(seg["radius"])
+
+        dx = px - cx
+        dy = py - cy
+        dist = math.hypot(dx, dy)
+
+        return abs(dist - radius)
+    def _angle_in_span(self, angle: float, start_deg: float, extent_deg: float) -> bool:
+        if extent_deg >= 360.0:
+            return True
+        a = self._norm_angle(angle)
+        s = self._norm_angle(start_deg)
+        e = self._norm_angle(start_deg + extent_deg)
+        if s <= e:
+            return s <= a <= e
+        return a >= s or a <= e
+
+    def _distance_to_segment_centerline(self, point: QPointF, seg: dict) -> float:
+        px = float(point.x())
+        py = float(point.y())
+        cx = float(self._ring_center.x())
+        cy = float(self._ring_center.y())
+        radius = float(seg.get("radius", max(1.0, (self._ring_inner_radius + self._ring_outer_radius) * 0.5)))
+        start_deg = float(seg["start_deg"])
+        extent_deg = float(seg["extent_deg"])
+
+        dx = px - cx
+        dy = py - cy
+        dist = math.hypot(dx, dy)
+        angle = self._norm_angle(math.degrees(math.atan2(dy, dx)))
+
+        if self._angle_in_span(angle, start_deg, extent_deg):
+            return abs(dist - radius)
+
+        end_deg = start_deg + extent_deg
+        best = float("inf")
+        for a in (start_deg, end_deg):
+            rad = math.radians(a)
+            ex = cx + radius * math.cos(rad)
+            ey = cy + radius * math.sin(rad)
+            best = min(best, math.hypot(px - ex, py - ey))
+        return best
+
+    def _cat_at_pos(self, pos) -> str | None:
+        if not self._segment_meta:
+            return None
+
+        dx = float(pos.x() - self._ring_center.x())
+        dy = float(pos.y() - self._ring_center.y())
+        dist = math.hypot(dx, dy)
+
+        # 只让“接近真正色环”的位置可命中，不把外面整圈发光都算进去
+        ring_mid = (self._ring_inner_radius + self._ring_outer_radius) * 0.5
+        radial_tol = 7.5
+        if abs(dist - ring_mid) > radial_tol:
+            return None
+
+        # 关键：Qt 圆弧坐标系要用 -dy，不能直接 atan2(dy, dx)
+        angle = self._norm_angle(math.degrees(math.atan2(-dy, dx)))
+
+        best_cat = None
+        best_score = None
+
+        for seg in self._segment_meta:
+            extent = max(0.2, float(seg["extent_deg"]))
+            center = self._norm_angle(seg["start_deg"] + extent * 0.5)
+
+            # 给小扇区一点额外容差，但不让大扇区无限抢占
+            angular_tol = min(6.0, 18.0 / extent)
+            half_span = extent * 0.5 + angular_tol
+
+            ang_diff = self._angle_delta(angle, center)
+            if ang_diff <= half_span:
+                radial_diff = abs(dist - ring_mid)
+
+                # 越靠近该扇区中心越优先；小扇区给一点点轻微优先
+                score = ang_diff * 2.0 + radial_diff * 0.35 - min(1.2, 10.0 / extent)
+
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_cat = seg["cat"]
+
+        return best_cat
+
+    def _cat_at_pos(self, pos) -> str | None:
+        if not self._segment_meta:
+            return None
+
+        point = QPointF(float(pos.x()), float(pos.y()))
+
+        best_seg = None
+        best_score = None
+
+        for seg in self._segment_meta:
+            hit_path = seg.get("hit_path")
+            if hit_path is None:
+                continue
+            if not hit_path.contains(point):
+                continue
+
+            extent = max(0.2, float(seg["extent_deg"]))
+            dist_score = self._distance_to_arc_centerline(point, seg)
+
+            # 小色块给一点轻微优先，但不要过强
+            tiny_bonus = min(1.2, 8.0 / extent)
+
+            score = dist_score - tiny_bonus
+            if best_score is None or score < best_score:
+                best_score = score
+                best_seg = seg
+
+        return None if best_seg is None else best_seg["cat"]
+
+    def mouseMoveEvent(self, e):
+        hovered = self._cat_at_pos(e.position())
+        if hovered != self.hovered_cat:
+            self.hovered_cat = hovered
+            self.update()
+        super().mouseMoveEvent(e)
+
+    def leaveEvent(self, e):
+        if self.hovered_cat is not None:
+            self.hovered_cat = None
+            self.update()
+        super().leaveEvent(e)
+
+    def paintEvent(self, e):
+        super().paintEvent(e)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        r = self.rect().adjusted(18, 18, -18, -18)
+        p.setPen(TEXT)
+        p.setFont(ui_font(self, 12, QFont.Bold))
+        title_right = max(r.left() + 140, self._controls_left - sp(self, 10))
+        title_rect = QRectF(r.left(), r.top(), max(120, title_right - r.left()), 24)
+        p.drawText(title_rect, Qt.AlignLeft | Qt.AlignVCenter, self._active_title())
+
+        active_items = self._active_items()
+        ordered, total, totals = aggregate_category_totals(active_items)
+
+        cx = r.center().x()
+        cy = r.top() + r.height() * 0.42
+        radius = min(r.width(), r.height()) * 0.24
+        arc_rect = QRectF(cx - radius, cy - radius, radius * 2, radius * 2)
+        self._ring_center = QPointF(cx, cy)
+        self._ring_inner_radius = radius - 3
+        self._ring_outer_radius = radius + 3
+        self._segment_meta = []
+
+        p.setPen(QPen(QColor(255, 255, 255, 120), 18, Qt.SolidLine, Qt.RoundCap))
+        p.drawArc(arc_rect, 0, 360 * 16)
+
+        if total <= 0:
+            p.setPen(QColor(TEXT.red(), TEXT.green(), TEXT.blue(), 140))
+            p.setFont(ui_font(self, 10, QFont.Bold))
+            p.drawText(QRectF(cx - 110, cy - 10, 220, 20), Qt.AlignCenter, "No Records")
+            return
+
+        start_deg = -90.0
+        for cat, sec in ordered:
+            extent = 360.0 * sec / total
+            col = color_for_category(cat)
+            hovered = cat == self.hovered_cat
+
+            # 视觉绘制仍然保留 glow
+            draw_rect = arc_rect.adjusted(-4, -4, 4, 4) if hovered else arc_rect
+            halo_width = 24 if hovered else 18
+            stroke_width = 10 if hovered else 7
+
+            p.setPen(QPen(QColor(col.red(), col.green(), col.blue(), 70 if hovered else 46), halo_width, Qt.SolidLine, Qt.RoundCap))
+            p.drawArc(draw_rect, int(start_deg * 16), int(extent * 16))
+
+            p.setPen(QPen(col, stroke_width, Qt.SolidLine, Qt.RoundCap))
+            p.drawArc(draw_rect, int(start_deg * 16), int(extent * 16))
+
+            # 命中路径只围绕“真正的实心圆环”，不要用 glow 宽度
+            hit_arc = QPainterPath()
+            hit_arc.arcMoveTo(arc_rect, start_deg)
+            hit_arc.arcTo(arc_rect, start_deg, extent)
+
+            stroker = QPainterPathStroker()
+            stroker.setCapStyle(Qt.RoundCap)
+            stroker.setJoinStyle(Qt.RoundJoin)
+
+            # 命中宽度只比实心环略宽一点，仍然贴着真正圆环
+            hit_width = 12.0 if extent >= 14.0 else 16.0
+            stroker.setWidth(hit_width)
+
+            self._segment_meta.append({
+                "cat": cat,
+                "sec": sec,
+                "start_deg": start_deg,
+                "extent_deg": extent,
+                "color": col,
+                "radius": radius,
+                "hit_path": stroker.createStroke(hit_arc),
+            })
+
+            start_deg += extent
+
+        p.setPen(QPen(QColor(255, 255, 255, 128), 2, Qt.SolidLine, Qt.RoundCap))
+        p.drawArc(arc_rect.adjusted(5, 5, -5, -5), int(-50 * 16), int(96 * 16))
+
+        hub = QRadialGradient(QPointF(cx, cy), radius * 0.58)
+        hub.setColorAt(0.0, QColor(255, 255, 255, 175 if self.hovered_cat else 165))
+        hub.setColorAt(1.0, QColor(255, 255, 255, 86 if self.hovered_cat else 80))
+        p.setBrush(hub)
+        p.setPen(QPen(QColor(255, 255, 255, 145), 1.1))
+        p.drawEllipse(QRectF(cx - radius * 0.49, cy - radius * 0.49, radius * 0.98, radius * 0.98))
+
+        center_text = fmt_hms(total)
+        center_sub = self._default_center_sub()
+        if self.hovered_cat and self.hovered_cat in totals:
+            hover_sec = totals[self.hovered_cat]
+            share = hover_sec / total * 100.0 if total else 0.0
+            center_text = fmt_hms(hover_sec)
+            center_sub = f"{self.hovered_cat} · {share:.1f}%"
+
+        p.setPen(QColor(TEXT.red(), TEXT.green(), TEXT.blue(), 235))
+        p.setFont(ui_font(self, 11, QFont.Bold))
+        p.drawText(QRectF(cx - 100, cy - 14, 200, 22), Qt.AlignCenter, center_text)
+
+        if center_sub:
+            p.setPen(QColor(SUBTEXT.red(), SUBTEXT.green(), SUBTEXT.blue(), 190))
+            p.setFont(ui_font(self, 8.8, QFont.Medium))
+            p.drawText(QRectF(cx - 110, cy + 8, 220, 18), Qt.AlignCenter, center_sub)
+
+        y = int(cy + radius + 14)
+        x = r.left() + 10
+        for cat, sec in ordered[:4]:
+            col = color_for_category(cat)
+            dot_size = 12 if cat == self.hovered_cat else 10
+            p.setPen(Qt.NoPen)
+            p.setBrush(col)
+            p.drawRoundedRect(QRectF(x, y + (5 if dot_size == 10 else 4), dot_size, dot_size), dot_size / 2, dot_size / 2)
+            p.setPen(QColor(TEXT.red(), TEXT.green(), TEXT.blue(), 215 if cat == self.hovered_cat else 205))
+            p.setFont(ui_font(self, 9, QFont.Bold if cat == self.hovered_cat else QFont.Medium))
+            share = sec / total * 100.0 if total else 0.0
+            p.drawText(QRectF(x + 18, y, 240, 20), Qt.AlignLeft | Qt.AlignVCenter, f"{cat}  {fmt_hms(sec)}  ·  {share:.1f}%")
+            y += 20
+
+
+class RangeStatsCard(LightGlassCard):
+    MODE_DAY = "day"
+    MODE_WEEK = "week"
+    MODE_MONTH = "month"
+
+    def __init__(self, parent=None):
+        super().__init__(radius=28, parent=parent)
+        self.scope_mode = self.MODE_MONTH
+        self.anchor_date = start_of_day(now_local())
+        self.items = []
+        self.on_scope_changed = None
+        self.setMinimumHeight(170)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 16, 16, 16)
+        lay.setSpacing(8)
+
+        self.lbl_title = QLabel("Work Summary")
+        self.lbl_title.setStyleSheet("color:rgba(33,42,60,235); font-weight:800;")
+        lay.addWidget(self.lbl_title)
+
+        self.lbl_period = QLabel("")
+        self.lbl_period.setStyleSheet("color:rgba(90,100,120,200); font-weight:600;")
+        lay.addWidget(self.lbl_period)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(6)
+        self.btn_day_scope = QPushButton("Day")
+        self.btn_week_scope = QPushButton("Week")
+        self.btn_month_scope = QPushButton("Month")
+        self._scope_buttons = {
+            self.MODE_DAY: self.btn_day_scope,
+            self.MODE_WEEK: self.btn_week_scope,
+            self.MODE_MONTH: self.btn_month_scope,
+        }
+        for mode, btn in self._scope_buttons.items():
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setFixedHeight(30)
+            btn.clicked.connect(lambda checked=False, m=mode: self.set_scope_mode(m, emit=True))
+            btn_row.addWidget(btn)
+        lay.addLayout(btn_row)
+
+        self.lbl_value = QLabel("00:00:00")
+        self.lbl_value.setAlignment(Qt.AlignCenter)
+        self.lbl_value.setStyleSheet("color:rgba(33,42,60,235); font-weight:900; font-size:22px;")
+        lay.addWidget(self.lbl_value)
+
+        self.lbl_meta = QLabel("")
+        self.lbl_meta.setAlignment(Qt.AlignCenter)
+        self.lbl_meta.setStyleSheet("color:rgba(33,42,60,205); font-weight:700;")
+        lay.addWidget(self.lbl_meta)
+
+        self.lbl_detail = QLabel("")
+        self.lbl_detail.setAlignment(Qt.AlignCenter)
+        self.lbl_detail.setWordWrap(True)
+        self.lbl_detail.setStyleSheet("color:rgba(90,100,120,195);")
+        lay.addWidget(self.lbl_detail)
+
+        self.set_scope_mode(self.scope_mode, emit=False)
+
+    def set_scope_mode(self, mode: str, emit: bool = False):
+        if mode not in (self.MODE_DAY, self.MODE_WEEK, self.MODE_MONTH):
+            mode = self.MODE_MONTH
+        self.scope_mode = mode
+        for key, btn in self._scope_buttons.items():
+            btn.setStyleSheet(glass_button_style(active=(key == self.scope_mode)))
+        if emit and self.on_scope_changed:
+            self.on_scope_changed(self.scope_mode)
+
+    def set_scope_items(self, anchor_dt: datetime, items):
+        self.anchor_date = start_of_day(anchor_dt)
+        self.items = list(items or [])
+        self._refresh_labels()
+
+    def _period_text(self) -> str:
+        if self.scope_mode == self.MODE_DAY:
+            return self.anchor_date.strftime("%Y-%m-%d")
+        if self.scope_mode == self.MODE_WEEK:
+            st = week_start(self.anchor_date)
+            ed = st + timedelta(days=6)
+            return f"{st.strftime('%Y-%m-%d')}  ~  {ed.strftime('%m-%d')}"
+        return month_start(self.anchor_date).strftime("%Y-%m")
+
+    def _refresh_labels(self):
+        ordered, total, totals = aggregate_category_totals(self.items)
+        work_sec = totals.get("Work", 0)
+        work_share = work_sec / total * 100.0 if total else 0.0
+        work_count = 0
+        for item in self.items:
+            sec = max(0, int(item.get("duration_sec", 0) or 0))
+            if sec > 0 and normalize_category(item.get("category", "Other")) == "Work":
+                work_count += 1
+        self.lbl_period.setText(self._period_text())
+        self.lbl_value.setText(fmt_hms(work_sec))
+        self.lbl_meta.setText(f"Total  {fmt_hms(total)}   ·   Work Items  {work_count}")
+        if ordered:
+            top_cat, top_sec = ordered[0]
+            self.lbl_detail.setText(f"Work Share  {work_share:.1f}%   ·   All Items  {len(self.items)}   ·   Top Category  {top_cat} {fmt_hms(top_sec)}")
+        else:
+            self.lbl_detail.setText("No records in this range")
+
+
+# ---------------- task dialog ----------------
+class GlassDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setModal(True)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        r = self.rect().adjusted(1, 1, -1, -1)
+        bg = QLinearGradient(r.topLeft(), r.bottomRight())
+        bg.setColorAt(0.0, QColor(248, 251, 250, 240))
+        bg.setColorAt(0.55, QColor(246, 249, 251, 232))
+        bg.setColorAt(1.0, QColor(249, 247, 252, 238))
+        p.setPen(Qt.NoPen)
+        p.setBrush(bg)
+        p.drawRoundedRect(r, 18, 18)
+        p.setPen(QPen(QColor(255, 255, 255, 220), 1.15))
+        p.setBrush(Qt.NoBrush)
+        p.drawRoundedRect(r, 18, 18)
+
+        clip = QPainterPath()
+        clip.addRoundedRect(QRectF(r), 18, 18)
+        p.save()
+        p.setClipPath(clip)
+        blobs = [
+            (QPointF(r.width() * 0.18, r.height() * 0.20), QColor(MINT.red(), MINT.green(), MINT.blue(), 34), r.width() * 0.35),
+            (QPointF(r.width() * 0.84, r.height() * 0.22), QColor(PURPLE.red(), PURPLE.green(), PURPLE.blue(), 28), r.width() * 0.32),
+            (QPointF(r.width() * 0.80, r.height() * 0.84), QColor(PURPLE.red(), PURPLE.green(), PURPLE.blue(), 24), r.width() * 0.34),
+        ]
+        p.setCompositionMode(QPainter.CompositionMode_Screen)
+        for center, col, rad in blobs:
+            g = QRadialGradient(center, rad)
+            g.setColorAt(0.0, col)
+            g.setColorAt(1.0, QColor(col.red(), col.green(), col.blue(), 0))
+            p.setBrush(g)
+            p.setPen(Qt.NoPen)
+            p.drawEllipse(center, rad, rad)
+        p.restore()
+
+
+class DialogTitleBar(QWidget):
+    def __init__(self, dialog: QDialog, title: str):
+        super().__init__(dialog)
+        self.dialog = dialog
+        self._dragging = False
+        self._offset = QPoint(0, 0)
+        self.setFixedHeight(34)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(6, 0, 4, 0)
+        lay.setSpacing(8)
+
+        self.lbl = QLabel(title)
+        self.lbl.setStyleSheet("color:rgba(33,42,60,235); font-weight:900; font-size:13px;")
+        lay.addWidget(self.lbl)
+        lay.addStretch(1)
+
+        self.btn_close = QPushButton("✕")
+        self.btn_close.setFixedSize(28, 24)
+        self.btn_close.setCursor(Qt.PointingHandCursor)
+        self.btn_close.setStyleSheet(glass_tiny_button_style())
+        self.btn_close.setFont(ui_font(self, 8.0, QFont.Bold))
+        self.btn_close.clicked.connect(self.dialog.reject)
+        lay.addWidget(self.btn_close)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton and not self.btn_close.geometry().contains(e.position().toPoint()):
+            self._dragging = True
+            self._offset = e.globalPosition().toPoint() - self.dialog.frameGeometry().topLeft()
+            e.accept()
+        else:
+            super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if self._dragging:
+            self.dialog.move(e.globalPosition().toPoint() - self._offset)
+            e.accept()
+        else:
+            super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        self._dragging = False
+        e.accept()
+
+
+class TaskDialog(GlassDialog):
+    def __init__(self, parent, start_dt: datetime, end_dt: datetime, categories, preset_cat=None, preset_task=None, title="Log Task"):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(560, 340)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 12, 14, 14)
+        lay.setSpacing(10)
+        lay.addWidget(DialogTitleBar(self, title))
+
+        meta = QLabel(
+            f"Start: {dt_to_str(start_dt)}\n"
+            f"End: {dt_to_str(end_dt)}\n"
+            f"Duration: {fmt_hms(int((end_dt - start_dt).total_seconds()))}"
+        )
+        meta.setStyleSheet("color:rgba(36,44,62,220); font-size:13px;")
+        lay.addWidget(meta)
+
+        self.cmb = QComboBox()
+        self.cmb.addItems(normalize_categories(categories))
+        if preset_cat:
+            self.cmb.setCurrentText(normalize_category(preset_cat))
+        lay.addWidget(self.cmb)
+
+        self.txt = QTextEdit()
+        self.txt.setPlaceholderText("What are you working on…")
+        preset_task = normalize_task_text(preset_task or "")
+        if preset_task != DEFAULT_TASK_PLACEHOLDER:
+            self.txt.setPlainText(preset_task)
+        lay.addWidget(self.txt, 1)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        lay.addWidget(btns)
+
+        self.setStyleSheet(
+            '''
+            QDialog{
+                background:transparent;
+                border:none;
+            }
+            QComboBox, QTextEdit{
+                background:rgba(255,255,255,24);
+                color:rgba(28,38,55,235);
+                border:1px solid rgba(255,255,255,175);
+                border-radius:14px;
+                padding:8px;
+                font-size:13px;
+            }
+            QComboBox::drop-down{border:0; width:28px;}
+            QDialogButtonBox QPushButton{
+                background:qlineargradient(x1:0,y1:0,x2:1,y2:1,
+                    stop:0 rgba(255,255,255,86),
+                    stop:1 rgba(255,255,255,42));
+                color:rgba(28,38,55,245);
+                border:1px solid rgba(255,255,255,210);
+                border-radius:12px;
+                padding:8px 14px;
+                font-weight:800;
+                min-width:72px;
+            }
+            QDialogButtonBox QPushButton:hover{border:1px solid rgba(255,255,255,235);}
+            '''
+        )
+
+    def category(self) -> str:
+        return normalize_category(self.cmb.currentText().strip() or DEFAULT_CATEGORIES[0])
+
+    def task_text(self) -> str:
+        return normalize_task_text(self.txt.toPlainText())
+
+
+class PlanDialog(GlassDialog):
+    TIME_OPTIONS = [f"{h:02d}:{m:02d}" for h in range(24) for m in (0, 15, 30, 45)]
+
+    def __init__(self, parent, start_dt: datetime, end_dt: datetime, categories, preset_cat=None, preset_task=None, title="Plan Task"):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(560, 410)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 12, 14, 14)
+        lay.setSpacing(10)
+        lay.addWidget(DialogTitleBar(self, title))
+
+        self.start_date_edit = QDateEdit(QDate(start_dt.year, start_dt.month, start_dt.day))
+        self.end_date_edit = QDateEdit(QDate(end_dt.year, end_dt.month, end_dt.day))
+        for w in (self.start_date_edit, self.end_date_edit):
+            w.setCalendarPopup(True)
+            w.setDisplayFormat("yyyy-MM-dd")
+            w.setButtonSymbols(QDateEdit.UpDownArrows)
+            w.setKeyboardTracking(False)
+
+        self.start_time_combo = self._make_time_combo(start_dt)
+        self.end_time_combo = self._make_time_combo(end_dt)
+
+        meta = QHBoxLayout()
+        meta.setSpacing(10)
+        meta.addWidget(QLabel("Start"))
+        meta.addWidget(self.start_date_edit, 1)
+        meta.addWidget(self.start_time_combo, 1)
+        meta.addWidget(QLabel("End"))
+        meta.addWidget(self.end_date_edit, 1)
+        meta.addWidget(self.end_time_combo, 1)
+        lay.addLayout(meta)
+
+        self.cmb = QComboBox()
+        self.cmb.addItems(normalize_categories(categories))
+        if preset_cat:
+            self.cmb.setCurrentText(normalize_category(preset_cat))
+        lay.addWidget(self.cmb)
+
+        self.txt = QTextEdit()
+        self.txt.setPlaceholderText("What are you planning to do…")
+        preset_task = normalize_task_text(preset_task or "")
+        if preset_task != DEFAULT_TASK_PLACEHOLDER:
+            self.txt.setPlainText(preset_task)
+        lay.addWidget(self.txt, 1)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        lay.addWidget(btns)
+
+        self.setStyleSheet(
+            """
+            QDialog{
+                background:transparent;
+                border:none;
+            }
+            QLabel{
+                color:rgba(36,44,62,220);
+                font-size:13px;
+                font-weight:800;
+            }
+            QComboBox, QTextEdit, QDateTimeEdit, QDateEdit{
+                background:rgba(255,255,255,24);
+                color:rgba(28,38,55,235);
+                border:1px solid rgba(255,255,255,175);
+                border-radius:14px;
+                padding:8px;
+                font-size:13px;
+            }
+            QComboBox::drop-down{border:0; width:28px;}
+            QDateTimeEdit::drop-down, QDateEdit::drop-down{border:0; width:26px;}
+            QDialogButtonBox QPushButton{
+                background:qlineargradient(x1:0,y1:0,x2:1,y2:1,
+                    stop:0 rgba(255,255,255,86),
+                    stop:1 rgba(255,255,255,42));
+                color:rgba(28,38,55,245);
+                border:1px solid rgba(255,255,255,210);
+                border-radius:12px;
+                padding:8px 14px;
+                font-weight:800;
+                min-width:72px;
+            }
+            QDialogButtonBox QPushButton:hover{border:1px solid rgba(255,255,255,235);}
+            """
+        )
+
+    def _make_time_combo(self, dt: datetime) -> QComboBox:
+        combo = QComboBox()
+        combo.setEditable(True)
+        combo.addItems(self.TIME_OPTIONS)
+        combo.setInsertPolicy(QComboBox.NoInsert)
+        combo.lineEdit().setPlaceholderText("HH:mm")
+        combo.setCurrentText(f"{dt.hour:02d}:{dt.minute:02d}")
+        return combo
+
+    def _parse_time_text(self, combo: QComboBox, label: str) -> QTime:
+        text = combo.currentText().strip().replace(".", ":")
+        for fmt in ("HH:mm", "H:mm", "HHmm", "Hmm"):
+            qtime = QTime.fromString(text, fmt)
+            if qtime.isValid():
+                combo.setCurrentText(qtime.toString("HH:mm"))
+                return qtime
+        raise ValueError(f"{label} time must be in HH:mm format.")
+
+    def accept(self):
+        try:
+            start_dt = self.start_datetime()
+            end_dt = self.end_datetime()
+        except ValueError as exc:
+            QMessageBox.warning(self, "Invalid Time", str(exc))
+            return
+        if end_dt <= start_dt:
+            QMessageBox.warning(self, "Invalid Time", "End time must be later than start time.")
+            return
+        super().accept()
+
+    def start_datetime(self) -> datetime:
+        qd = self.start_date_edit.date()
+        qt = self._parse_time_text(self.start_time_combo, "Start")
+        return datetime(qd.year(), qd.month(), qd.day(), qt.hour(), qt.minute())
+
+    def end_datetime(self) -> datetime:
+        qd = self.end_date_edit.date()
+        qt = self._parse_time_text(self.end_time_combo, "End")
+        return datetime(qd.year(), qd.month(), qd.day(), qt.hour(), qt.minute())
+
+    def category(self) -> str:
+        return normalize_category(self.cmb.currentText().strip() or DEFAULT_CATEGORIES[0])
+
+    def task_text(self) -> str:
+        return normalize_task_text(self.txt.toPlainText())
+
+
+class DateJumpDialog(GlassDialog):
+    def __init__(self, parent, current_dt: datetime):
+        super().__init__(parent)
+        self.setWindowTitle("Choose Date")
+        self.resize(330, 318)
+        self.selected_dt = start_of_day(current_dt)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 12, 14, 14)
+        lay.setSpacing(10)
+        lay.addWidget(DialogTitleBar(self, "Choose Date"))
+
+        self.cal = QCalendarWidget()
+        self.cal.setLocale(QLocale(QLocale.English, QLocale.UnitedStates))
+        self.cal.setGridVisible(False)
+        self.cal.setVerticalHeaderFormat(QCalendarWidget.NoVerticalHeader)
+        self.cal.setSelectedDate(QDate(current_dt.year, current_dt.month, current_dt.day))
+        self.cal.clicked.connect(self._on_date_clicked)
+        self.cal.setStyleSheet(
+            """
+            QCalendarWidget{
+                background: rgba(255,255,255,46);
+                border: none;
+                border-radius: 16px;
+            }
+            QCalendarWidget QWidget#qt_calendar_navigationbar{
+                background: rgba(255,255,255,92);
+                border: 1px solid rgba(255,255,255,210);
+                border-radius: 14px;
+            }
+            QCalendarWidget QToolButton{
+                color: rgba(28,38,55,235);
+                background: transparent;
+                border: none;
+                padding: 6px 10px;
+                font-weight: 800;
+            }
+            QCalendarWidget QMenu{
+                background: rgba(248,250,252,238);
+                color: rgba(28,38,55,235);
+                border: 1px solid rgba(255,255,255,220);
+                border-radius: 10px;
+            }
+            QCalendarWidget QSpinBox{
+                background: rgba(255,255,255,110);
+                color: rgba(28,38,55,235);
+                border: 1px solid rgba(255,255,255,210);
+                border-radius: 10px;
+                padding: 3px 8px;
+            }
+            QCalendarWidget QWidget#qt_calendar_calendarview{
+                background: rgba(255,255,255,86);
+                border: none;
+            }
+            QCalendarWidget QAbstractItemView,
+            QCalendarWidget QTableView{
+                background: rgba(255,255,255,86);
+                color: rgba(28,38,55,235);
+                selection-background-color: rgba(255,255,255,0);
+                selection-color: rgba(28,38,55,235);
+                alternate-background-color: rgba(255,255,255,86);
+                outline: 0;
+                border: none;
+                gridline-color: rgba(120,130,150,28);
+            }
+            QCalendarWidget QAbstractItemView::item{
+                background: rgba(255,255,255,0);
+            }
+            QCalendarWidget QAbstractItemView::item:selected{
+                border: 2px solid rgba(255,255,255,235);
+                border-radius: 12px;
+                font-weight: 800;
+                background: rgba(255,255,255,58);
+                color: rgba(28,38,55,240);
+            }
+            QCalendarWidget QHeaderView::section{
+                background: rgba(255,255,255,0);
+                border: none;
+                color: rgba(33,42,60,215);
+                font-weight: 800;
+            }
+            """
+        )
+        cal_view = self.cal.findChild(QWidget, "qt_calendar_calendarview")
+        if cal_view is not None:
+            cal_view.setAutoFillBackground(True)
+            cal_view.setStyleSheet("background: rgba(255,255,255,86); border:none;")
+            if hasattr(cal_view, "viewport") and cal_view.viewport() is not None:
+                cal_view.viewport().setAutoFillBackground(True)
+                cal_view.viewport().setStyleSheet("background: rgba(255,255,255,86);")
+        lay.addWidget(self.cal, 1)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        today_btn = QPushButton("Today")
+        btns.addButton(today_btn, QDialogButtonBox.ActionRole)
+        today_btn.clicked.connect(self._jump_today)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        lay.addWidget(btns)
+
+        self.setStyleSheet(
+            """
+            QDialogButtonBox QPushButton{
+                background:rgba(255,255,255,72);
+                color:rgba(28,38,55,235);
+                border:1px solid rgba(255,255,255,220);
+                border-radius:14px;
+                padding:8px 16px;
+                font-weight:800;
+                min-width:68px;
+            }
+            """
+        )
+
+    def _on_date_clicked(self, qd: QDate):
+        self.selected_dt = datetime(qd.year(), qd.month(), qd.day())
+
+    def _jump_today(self):
+        now = now_local()
+        qd = QDate(now.year, now.month, now.day)
+        self.cal.setSelectedDate(qd)
+        self.cal.setCurrentPage(now.year, now.month)
+        self.selected_dt = start_of_day(now)
+
+    def selected_datetime(self) -> datetime:
+        qd = self.cal.selectedDate()
+        return datetime(qd.year(), qd.month(), qd.day())
+
+
+# ---------------- titlebar ----------------
+class TitleBar(QWidget):
+    def __init__(self, win: QMainWindow):
+        super().__init__(win)
+        self.win = win
+        self._dragging = False
+        self._offset = QPoint(0, 0)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(8)
+
+        self.left_spacer = QWidget()
+        self.left_spacer.setFixedWidth(104)
+        lay.addWidget(self.left_spacer)
+        lay.addStretch(1)
+
+        self.lbl = QLabel(APP_NAME)
+        self.lbl.setStyleSheet("color:rgba(33,42,60,235); font-weight:900;")
+        lay.addWidget(self.lbl, 0, Qt.AlignCenter)
+        lay.addStretch(1)
+
+        self.right_box = QWidget()
+        right_lay = QHBoxLayout(self.right_box)
+        right_lay.setContentsMargins(0, 0, 0, 0)
+        right_lay.setSpacing(8)
+
+        self.btn_pin = QPushButton()
+        self.btn_pin.setCursor(Qt.PointingHandCursor)
+        self.btn_pin.setStyleSheet(glass_tiny_button_style())
+        self.btn_pin.clicked.connect(self.win.toggle_window_locked)
+        right_lay.addWidget(self.btn_pin)
+
+        self.btn_close = QPushButton("✕")
+        self.btn_close.setCursor(Qt.PointingHandCursor)
+        self.btn_close.setStyleSheet(glass_tiny_button_style())
+        self.btn_close.clicked.connect(self.win.close)
+        right_lay.addWidget(self.btn_close)
+        lay.addWidget(self.right_box)
+
+        self.apply_scale()
+        self.refresh_lock_button()
+
+    def _sync_center(self):
+        self.left_spacer.setFixedWidth(max(10, self.right_box.sizeHint().width()))
+
+    def apply_scale(self):
+        self.setFixedHeight(sp(self, 38))
+        self.lbl.setFont(ui_font(self, 17, QFont.Black))
+        self.btn_pin.setFixedSize(sp(self, 60), sp(self, 26))
+        self.btn_close.setFixedSize(sp(self, 28), sp(self, 26))
+        self.btn_pin.setFont(ui_font(self, 8.8, QFont.Bold))
+        self.btn_close.setFont(ui_font(self, 8.0, QFont.Bold))
+
+    def refresh_lock_button(self):
+        locked = self.win.is_window_locked() if hasattr(self.win, "is_window_locked") else False
+        self.btn_pin.setText("Fixed" if locked else "Pin")
+        if locked:
+            self.btn_pin.setStyleSheet(glass_tiny_button_style(active=True))
+        else:
+            self.btn_pin.setStyleSheet(glass_tiny_button_style())
+        self._sync_center()
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._sync_center()
+
+    def mousePressEvent(self, e):
+        if getattr(self.win, "window_locked", False):
+            return
+        blocked = self.btn_close.geometry().contains(e.position().toPoint()) or self.btn_pin.geometry().contains(e.position().toPoint())
+        if e.button() == Qt.LeftButton and not blocked:
+            self._dragging = True
+            self._offset = e.globalPosition().toPoint() - self.win.frameGeometry().topLeft()
+            e.accept()
+
+    def mouseMoveEvent(self, e):
+        if getattr(self.win, "window_locked", False):
+            return
+        if self._dragging:
+            self.win.move(e.globalPosition().toPoint() - self._offset)
+            e.accept()
+
+    def mouseReleaseEvent(self, e):
+        self._dragging = False
+        e.accept()
+
+
+@dataclass
+class RunningSession:
+    start_dt: datetime
+    start_monotonic: float
+
+
+# ---------------- calendar canvas ----------------
+class CalendarCanvas(LightGlassCard):
+    MODE_MONTH = 0
+    MODE_WEEK = 1
+    MODE_DAY = 2
+
+    def __init__(self, parent=None):
+        super().__init__(radius=30, parent=parent)
+        self.glass_opacity_scale = CALENDAR_GLASS_OPACITY_SCALE
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.selected_date = start_of_day(now_local())
+        self.mode = self.MODE_MONTH
+        self.view_start_hour = 9.0
+        self.visible_hours = 3.0
+        self.hovered_date: datetime | None = None
+        self.get_sessions_callback = None
+        self.get_plans_callback = None
+        self.on_selected_date_changed = None
+        self.on_mode_changed = None
+        self.on_edit_session = None
+        self.on_edit_plan = None
+        self.on_add_plan_requested = None
+        self.on_pick_month_year = None
+        self.on_duplicate_item_requested = None
+        self.on_delete_item_requested = None
+        self._title_hit = QRectF()
+        self._month_cells: list[tuple[QRectF, datetime]] = []
+        self._week_day_rects: list[tuple[QRectF, datetime]] = []
+        self._item_hits: list[dict] = []
+        self._grid_rect: QRectF | None = None
+        self.focus_item_source: str | None = None
+        self.focus_item_id: int | None = None
+        self._duplicate_drag_hit: dict | None = None
+        self._duplicate_drag_start: datetime | None = None
+        self._duplicate_drag_end: datetime | None = None
+        self._duplicate_drag_rect: QRectF | None = None
+        self.setMouseTracking(True)
+
+    def set_sessions_callback(self, fn):
+        self.get_sessions_callback = fn
+
+    def set_plans_callback(self, fn):
+        self.get_plans_callback = fn
+
+    def set_selected_date(self, dt: datetime):
+        self.selected_date = start_of_day(dt)
+        self.update()
+
+    def set_mode(self, mode: int):
+        mode = max(self.MODE_MONTH, min(self.MODE_DAY, int(mode)))
+        if self.mode != mode:
+            self.mode = mode
+            if self.on_mode_changed:
+                self.on_mode_changed(mode)
+        self.update()
+
+    def visible_title(self) -> str:
+        if self.mode == self.MODE_MONTH:
+            return self.selected_date.strftime("%Y-%m")
+        if self.mode == self.MODE_WEEK:
+            st = week_start(self.selected_date)
+            ed = st + timedelta(days=6)
+            return f"{st.strftime('%Y-%m-%d')}  ~  {ed.strftime('%m-%d')}"
+        return self.selected_date.strftime("%Y-%m-%d")
+
+    def _sessions_in_range(self, start_dt: datetime, end_dt: datetime):
+        if self.get_sessions_callback:
+            return self.get_sessions_callback(start_dt, end_dt)
+        return []
+
+    def _plans_in_range(self, start_dt: datetime, end_dt: datetime):
+        if self.get_plans_callback:
+            return self.get_plans_callback(start_dt, end_dt)
+        return []
+
+    def _combined_items_in_range(self, start_dt: datetime, end_dt: datetime):
+        items = []
+        for s in self._sessions_in_range(start_dt, end_dt):
+            x = dict(s)
+            x["source"] = "session"
+            x = clamp_item_to_range(x, start_dt, end_dt)
+            if x is not None:
+                items.append(x)
+        for s in self._plans_in_range(start_dt, end_dt):
+            x = dict(s)
+            x["source"] = "plan"
+            x = clamp_item_to_range(x, start_dt, end_dt)
+            if x is not None:
+                items.append(x)
+        items.sort(key=lambda item: item.get("start", ""))
+        return items
+
+    def set_focus_item(self, source: str | None, sid: int | None):
+        self.focus_item_source = source
+        self.focus_item_id = int(sid) if sid is not None else None
+        self.update()
+
+    def _item_title_text(self, item: dict) -> str:
+        text = normalize_task_text(item.get("task_text", ""))
+        if text == DEFAULT_TASK_PLACEHOLDER:
+            return normalize_category(item.get("category", "Other"))
+        return text
+
+    def _is_focused_item(self, item: dict) -> bool:
+        return (
+            self.focus_item_source is not None
+            and self.focus_item_id is not None
+            and str(item.get("source", "")) == str(self.focus_item_source)
+            and int(item.get("id", -1)) == int(self.focus_item_id)
+        )
+
+    def _hit_item_at(self, pos):
+        for hit in reversed(self._item_hits):
+            rect = hit.get("rect")
+            if rect is not None and rect.contains(pos):
+                return hit
+        return None
+
+    def _proposal_from_drag_hit(self, pos, item: dict):
+        if self.mode != self.MODE_WEEK or self._grid_rect is None or not self._grid_rect.contains(pos):
+            return None, None, None
+        base_dt = self._date_at_position(pos)
+        if base_dt is None:
+            return None, None, None
+        start_dt, _ = self._proposal_from_position(pos, base_dt)
+        duration_sec = max(60, int(item.get("duration_sec", 0) or 0))
+        end_dt = start_dt + timedelta(seconds=duration_sec)
+        ss = str_to_dt(item["start"])
+        ee = str_to_dt(item["end"])
+        start_hour = start_dt.hour + start_dt.minute / 60 + start_dt.second / 3600
+        end_hour = end_dt.hour + end_dt.minute / 60 + end_dt.second / 3600
+        view_end = self.view_start_hour + self.visible_hours
+        col_index = (start_of_day(start_dt) - week_start(self.selected_date)).days
+        if col_index < 0 or col_index > 6:
+            return start_dt, end_dt, None
+        y1 = self._grid_rect.top() + (max(self.view_start_hour, start_hour) - self.view_start_hour) / self.visible_hours * self._grid_rect.height()
+        y2 = self._grid_rect.top() + (min(view_end, end_hour) - self.view_start_hour) / self.visible_hours * self._grid_rect.height()
+        if y2 < y1 + 20:
+            y2 = y1 + 20
+        hour_w = 72
+        col_w = (self._grid_rect.width() - hour_w) / 7.0
+        x = self._grid_rect.left() + hour_w + col_index * col_w + 6
+        rect = QRectF(x, y1 + 4, col_w - 12, max(18.0, y2 - y1 - 8))
+        return start_dt, end_dt, rect
+
+    def _emit_selection(self, dt: datetime):
+        self.selected_date = start_of_day(dt)
+        if self.on_selected_date_changed:
+            self.on_selected_date_changed(self.selected_date)
+        self.update()
+
+    def mouseMoveEvent(self, e):
+        pos = e.position()
+        if self._duplicate_drag_hit is not None:
+            self.hovered_date = self._date_at_position(pos)
+            self._duplicate_drag_start, self._duplicate_drag_end, self._duplicate_drag_rect = self._proposal_from_drag_hit(pos, self._duplicate_drag_hit)
+            self.update()
+            e.accept()
+            return
+        self.hovered_date = self._date_at_position(pos)
+        self.update()
+        super().mouseMoveEvent(e)
+
+    def leaveEvent(self, e):
+        self.hovered_date = None
+        if self._duplicate_drag_hit is None:
+            self.update()
+        super().leaveEvent(e)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            pos = e.position()
+            if self._title_hit.contains(pos):
+                if self.on_pick_month_year:
+                    self.on_pick_month_year(self.selected_date)
+                return
+            hit = self._hit_item_at(pos)
+            if hit is not None:
+                self.setFocus(Qt.MouseFocusReason)
+                self.set_focus_item(hit.get("source"), hit.get("id"))
+                try:
+                    self._emit_selection(start_of_day(str_to_dt(hit.get("start"))))
+                except Exception:
+                    self.update()
+                if self.mode == self.MODE_WEEK and (e.modifiers() & Qt.AltModifier):
+                    self._duplicate_drag_hit = dict(hit)
+                    self._duplicate_drag_start = None
+                    self._duplicate_drag_end = None
+                    self._duplicate_drag_rect = None
+                e.accept()
+                return
+            dt = self._date_at_position(pos)
+            if dt:
+                self.setFocus(Qt.MouseFocusReason)
+                self._emit_selection(dt)
+                e.accept()
+                return
+        super().mousePressEvent(e)
+
+    def mouseDoubleClickEvent(self, e):
+        pos = e.position()
+        hit = self._hit_item_at(pos)
+        if hit is not None:
+            self.setFocus(Qt.MouseFocusReason)
+            self.set_focus_item(hit.get("source"), hit.get("id"))
+            try:
+                self._emit_selection(start_of_day(str_to_dt(hit.get("start"))))
+            except Exception:
+                self.update()
+            source = str(hit.get("source", "session"))
+            sid = int(hit.get("id", -1))
+            if source == "session" and self.on_edit_session:
+                self.on_edit_session(sid)
+            elif source == "plan" and self.on_edit_plan:
+                self.on_edit_plan(sid)
+            e.accept()
+            return
+
+        dt = self._date_at_position(pos)
+        if dt:
+            self._emit_selection(dt)
+        if self.mode == self.MODE_MONTH:
+            if dt:
+                self.set_mode(self.MODE_WEEK)
+                e.accept()
+                return
+        else:
+            can_add = False
+            if self.mode == self.MODE_DAY:
+                can_add = self._grid_rect is not None and self._grid_rect.contains(pos)
+            elif self.mode == self.MODE_WEEK:
+                can_add = dt is not None
+            if self.on_add_plan_requested and can_add:
+                base_dt = dt or self.selected_date
+                start_dt, end_dt = self._proposal_from_position(pos, base_dt)
+                self.on_add_plan_requested(start_dt, end_dt)
+                e.accept()
+                return
+        super().mouseDoubleClickEvent(e)
+
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.LeftButton and self._duplicate_drag_hit is not None:
+            ret = None
+            if self.on_duplicate_item_requested and self._duplicate_drag_start is not None and self._duplicate_drag_end is not None:
+                ret = self.on_duplicate_item_requested(dict(self._duplicate_drag_hit), self._duplicate_drag_start, self._duplicate_drag_end)
+            self._duplicate_drag_hit = None
+            self._duplicate_drag_start = None
+            self._duplicate_drag_end = None
+            self._duplicate_drag_rect = None
+            if isinstance(ret, tuple) and len(ret) == 2:
+                self.set_focus_item(ret[0], ret[1])
+            self.update()
+            e.accept()
+            return
+        super().mouseReleaseEvent(e)
+
+    def wheelEvent(self, e):
+        delta = e.angleDelta().y()
+        if delta == 0:
+            e.ignore()
+            return
+        steps = 1 if delta < 0 else -1
+
+        if self.mode in (self.MODE_DAY, self.MODE_WEEK):
+            if e.modifiers() & Qt.ControlModifier:
+                anchor = self._hour_at_position(e.position())
+                self._zoom_visible_hours(anchor, zoom_in=(delta > 0))
+            else:
+                step_hours = 1.0 if self.visible_hours <= 8 else max(1.0, round(self.visible_hours / 6.0, 2))
+                self.view_start_hour = max(0.0, min(24.0 - self.visible_hours, self.view_start_hour + (step_hours if delta < 0 else -step_hours)))
+                self._normalize_view_window()
+            self.update()
+            e.accept()
+            return
+
+        if self.mode == self.MODE_MONTH:
+            base = month_start(self.selected_date)
+            new_dt = add_months(base, steps)
+            day = min(self.selected_date.day, 28)
+            self._emit_selection(new_dt.replace(day=day))
+            self.update()
+            e.accept()
+            return
+
+        e.ignore()
+
+    def keyPressEvent(self, e):
+        if e.key() in (Qt.Key_Delete, Qt.Key_Backspace):
+            if self.focus_item_source is not None and self.focus_item_id is not None and self.on_delete_item_requested:
+                self.on_delete_item_requested(self.focus_item_source, self.focus_item_id)
+                e.accept()
+                return
+        super().keyPressEvent(e)
+
+    def _normalize_view_window(self):
+        step = 0.25
+        self.visible_hours = max(2.0, min(24.0, round(self.visible_hours / step) * step))
+        max_start = max(0.0, 24.0 - self.visible_hours)
+        self.view_start_hour = max(0.0, min(max_start, round(self.view_start_hour / step) * step))
+
+    def _fmt_axis_time(self, hour_value: float) -> str:
+        total_minutes = int(round(hour_value * 60)) % (24 * 60)
+        hh = total_minutes // 60
+        mm = total_minutes % 60
+        return f"{hh:02d}:{mm:02d}"
+
+    def _zoom_visible_hours(self, anchor_hour: float, zoom_in: bool):
+        old_hours = float(self.visible_hours)
+        new_hours = max(2.0, round(old_hours * 0.82, 2)) if zoom_in else min(24.0, round(old_hours * 1.22 + 0.05, 2))
+        if abs(new_hours - old_hours) < 0.01:
+            return
+        ratio = 0.5 if old_hours <= 0 else (anchor_hour - self.view_start_hour) / old_hours
+        ratio = max(0.0, min(1.0, ratio))
+        new_start = anchor_hour - ratio * new_hours
+        self.visible_hours = new_hours
+        self.view_start_hour = max(0.0, min(24.0 - self.visible_hours, new_start))
+        self._normalize_view_window()
+
+    def _hour_at_position(self, pos) -> float:
+        if not self._grid_rect or not self._grid_rect.contains(pos):
+            return self.view_start_hour + self.visible_hours * 0.5
+        rel = (pos.y() - self._grid_rect.top()) / max(1.0, self._grid_rect.height())
+        rel = max(0.0, min(1.0, rel))
+        return self.view_start_hour + rel * self.visible_hours
+
+    def _date_at_position(self, pos) -> datetime | None:
+        if self.mode == self.MODE_MONTH:
+            for rect, dt in self._month_cells:
+                if rect.contains(pos):
+                    return dt
+        elif self.mode == self.MODE_WEEK:
+            if self._grid_rect is not None:
+                for rect, dt in self._week_day_rects:
+                    hit_rect = QRectF(rect.left(), self._grid_rect.top(), rect.width(), self._grid_rect.height())
+                    if hit_rect.contains(pos):
+                        return dt
+            for rect, dt in self._week_day_rects:
+                if rect.contains(pos):
+                    return dt
+        else:
+            if self._grid_rect is not None and self._grid_rect.contains(pos):
+                return self.selected_date
+            if self._week_day_rects:
+                return self.selected_date
+        return None
+
+    def _proposal_from_position(self, pos, fallback_dt: datetime | None = None):
+        dt = fallback_dt or self._date_at_position(pos) or self.selected_date
+        hour = self._hour_at_position(pos)
+        minute = int(round((hour - int(hour)) * 60 / 15.0) * 15)
+        hour_int = int(hour)
+        if minute >= 60:
+            hour_int += 1
+            minute = 0
+        hour_int = max(0, min(23, hour_int))
+        start_dt = start_of_day(dt).replace(hour=hour_int, minute=minute, second=0, microsecond=0)
+        end_dt = start_dt + timedelta(hours=1)
+        if start_of_day(end_dt) != start_of_day(start_dt):
+            end_dt = start_of_day(start_dt) + timedelta(hours=23, minutes=59)
+        return start_dt, end_dt
+
+    def _pill(self, painter: QPainter, rect: QRectF, text: str, color: QColor):
+        if rect.height() < 10 or rect.width() < 18:
+            return
+        bg = QColor(color.red(), color.green(), color.blue(), 72)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(bg)
+        painter.drawRoundedRect(rect, 7, 7)
+        painter.setPen(QColor(36, 46, 64, 220))
+        f = ui_font(self, 8, QFont.Bold)
+        painter.setFont(f)
+        painter.drawText(rect.adjusted(6, 0, -6, 0), Qt.AlignVCenter | Qt.AlignLeft, text)
+
+    def paintEvent(self, e):
+        super().paintEvent(e)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        r = self.rect().adjusted(18, 16, -18, -18)
+        self._month_cells.clear()
+        self._week_day_rects.clear()
+        self._item_hits.clear()
+        self._grid_rect = None
+
+        p.setPen(TEXT)
+        p.setFont(ui_font(self, 12, QFont.Bold))
+        p.drawText(QRectF(r.left(), r.top(), r.width(), 24), Qt.AlignLeft | Qt.AlignVCenter, "Calendar")
+
+        chip_w = 170 if self.mode == self.MODE_MONTH else 236
+        title_rect = QRectF(r.left(), r.top() + 30, chip_w, 36)
+        self._title_hit = title_rect
+        p.setPen(QPen(QColor(255, 255, 255, 210), 1.0))
+        p.setBrush(QColor(255, 255, 255, 112))
+        p.drawRoundedRect(title_rect, 18, 18)
+        p.setPen(QColor(TEXT.red(), TEXT.green(), TEXT.blue(), 230))
+        p.setFont(ui_font(self, 13, QFont.Bold))
+        p.drawText(title_rect.adjusted(14, 0, -24, 0), Qt.AlignLeft | Qt.AlignVCenter, self.visible_title())
+        p.setFont(ui_font(self, 10, QFont.Bold))
+        p.drawText(title_rect.adjusted(title_rect.width() - 24, 0, -10, 0), Qt.AlignCenter, "▾")
+
+        if self.mode == self.MODE_DAY:
+            hint = "Click item: select · Double-click item: edit · Empty double-click: add plan"
+        elif self.mode == self.MODE_WEEK:
+            hint = "Click item: select · Double-click item: edit · Empty double-click: add plan"
+        else:
+            hint = "Click item: select · Double-click item: edit · Double-click date: open week"
+        p.setPen(QColor(SUBTEXT.red(), SUBTEXT.green(), SUBTEXT.blue(), 165))
+        p.setFont(ui_font(self, 9))
+        p.drawText(QRectF(r.right() - 320, r.top() + 36, 320, 22), Qt.AlignRight | Qt.AlignVCenter, hint)
+
+        content = QRectF(r.left(), r.top() + 78, r.width(), r.height() - 80)
+        if self.mode == self.MODE_MONTH:
+            self._paint_month(p, content)
+        elif self.mode == self.MODE_WEEK:
+            self._paint_week(p, content)
+        else:
+            self._paint_day(p, content)
+
+    def _paint_month(self, p: QPainter, area: QRectF):
+        headers = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        header_h = 28
+        cell_w = area.width() / 7.0
+        cell_h = (area.height() - header_h) / 6.0
+
+        for i, name in enumerate(headers):
+            hr = QRectF(area.left() + i * cell_w, area.top(), cell_w, header_h)
+            col = WEEKEND if i >= 5 else QColor(TEXT.red(), TEXT.green(), TEXT.blue(), 215)
+            p.setPen(col)
+            p.setFont(ui_font(self, 10, QFont.Bold))
+            p.drawText(hr, Qt.AlignCenter, name)
+
+        first = month_start(self.selected_date)
+        grid_start = first - timedelta(days=first.weekday())
+        grid_end = grid_start + timedelta(days=41, hours=23, minutes=59)
+        sessions = self._combined_items_in_range(grid_start, grid_end)
+        by_day = {}
+        for s in sessions:
+            st = str_to_dt(s["start"])
+            by_day.setdefault(start_of_day(st), []).append(s)
+
+        for idx in range(42):
+            dt = grid_start + timedelta(days=idx)
+            row = idx // 7
+            col = idx % 7
+            rect = QRectF(area.left() + col * cell_w, area.top() + header_h + row * cell_h, cell_w, cell_h)
+            self._month_cells.append((rect, dt))
+
+            hovered = self.hovered_date and start_of_day(self.hovered_date) == dt
+            is_selected = start_of_day(self.selected_date) == dt
+            is_today = start_of_day(now_local()) == dt
+            is_other = dt.month != self.selected_date.month
+
+            if hovered:
+                p.setPen(Qt.NoPen)
+                p.setBrush(QColor(255, 255, 255, 36))
+                p.drawRoundedRect(rect.adjusted(3, 3, -3, -3), 14, 14)
+
+            if is_selected:
+                p.setPen(QPen(QColor(255, 255, 255, 240), 2.2))
+                p.setBrush(QColor(255, 255, 255, 26))
+                p.drawRoundedRect(rect.adjusted(5, 5, -5, -5), 15, 15)
+            elif is_today:
+                p.setPen(QPen(QColor(255, 255, 255, 200), 1.5))
+                p.setBrush(Qt.NoBrush)
+                p.drawRoundedRect(rect.adjusted(7, 7, -7, -7), 14, 14)
+
+            num_col = QColor(175, 180, 194) if is_other else QColor(TEXT.red(), TEXT.green(), TEXT.blue(), 212)
+            if dt.weekday() >= 5 and not is_other:
+                num_col = WEEKEND
+            if is_selected:
+                num_col = QColor(TEXT.red(), TEXT.green(), TEXT.blue(), 235)
+            p.setPen(num_col)
+            pf = ui_font(self, 12, QFont.Bold if is_selected or is_today else QFont.Medium)
+            p.setFont(pf)
+            p.drawText(QRectF(rect.left() + 10, rect.top() + 8, rect.width() - 16, 20), Qt.AlignLeft | Qt.AlignTop, str(dt.day))
+
+            day_items = by_day.get(dt, [])
+            line_y = rect.top() + 34
+            for s in day_items[:4]:
+                text = normalize_task_text(s["task_text"])
+                if text == DEFAULT_TASK_PLACEHOLDER:
+                    text = normalize_category(s["category"])
+                label = self._item_title_text(s)[:12]
+                pr = QRectF(rect.left() + 8, line_y, rect.width() - 16, 16)
+                if self._is_focused_item(s):
+                    p.setPen(QPen(QColor(255, 255, 255, 235), 1.6))
+                    p.setBrush(QColor(255, 255, 255, 28))
+                    p.drawRoundedRect(pr.adjusted(-1, -1, 1, 1), 8, 8)
+                self._pill(p, pr, label, color_for_category(s["category"]))
+                hit = dict(s)
+                hit["rect"] = QRectF(pr)
+                self._item_hits.append(hit)
+                line_y += 18
+
+    def _paint_week(self, p: QPainter, area: QRectF):
+        st = week_start(self.selected_date)
+        ed = st + timedelta(days=6, hours=23, minutes=59)
+        sessions = self._combined_items_in_range(st, ed)
+        by_day = {}
+        for s in sessions:
+            d = start_of_day(str_to_dt(s["start"]))
+            by_day.setdefault(d, []).append(s)
+
+        head_h = 54
+        hour_w = 72
+        grid = QRectF(area.left(), area.top() + head_h, area.width(), area.height() - head_h)
+        self._grid_rect = grid
+        col_w = (grid.width() - hour_w) / 7.0
+
+        for i in range(7):
+            dt = st + timedelta(days=i)
+            rect = QRectF(grid.left() + hour_w + i * col_w, area.top(), col_w, head_h)
+            self._week_day_rects.append((rect, dt))
+            if start_of_day(self.selected_date) == dt:
+                p.setPen(QPen(QColor(255, 255, 255, 230), 2.0))
+                p.setBrush(QColor(255, 255, 255, 34))
+                p.drawRoundedRect(rect.adjusted(4, 4, -4, -4), 14, 14)
+            p.setPen(WEEKEND if i >= 5 else QColor(TEXT.red(), TEXT.green(), TEXT.blue(), 220))
+            p.setFont(ui_font(self, 10, QFont.Bold))
+            p.drawText(QRectF(rect.left(), rect.top() + 6, rect.width(), 16), Qt.AlignCenter, dt.strftime("%a"))
+            p.setFont(ui_font(self, 12, QFont.Bold if start_of_day(self.selected_date) == dt else QFont.Medium))
+            p.drawText(QRectF(rect.left(), rect.top() + 24, rect.width(), 20), Qt.AlignCenter, dt.strftime("%m-%d"))
+
+        p.setPen(QPen(QColor(TEXT.red(), TEXT.green(), TEXT.blue(), 38), 1))
+        for idx in range(int(self.visible_hours) + 1):
+            hour = self.view_start_hour + idx
+            y = grid.top() + (hour - self.view_start_hour) / max(0.0001, self.visible_hours) * grid.height()
+            p.drawLine(int(grid.left() + hour_w), int(y), int(grid.right()), int(y))
+            p.setPen(QColor(SUBTEXT.red(), SUBTEXT.green(), SUBTEXT.blue(), 180))
+            p.setFont(ui_font(self, 10))
+            p.drawText(QRectF(grid.left(), y - 8, hour_w - 10, 20), Qt.AlignRight | Qt.AlignVCenter, self._fmt_axis_time(hour))
+            p.setPen(QPen(QColor(TEXT.red(), TEXT.green(), TEXT.blue(), 38), 1))
+        for cc in range(8):
+            x = grid.left() + hour_w + cc * col_w
+            p.drawLine(int(x), int(grid.top()), int(x), int(grid.bottom()))
+
+        view_end = self.view_start_hour + self.visible_hours
+        for i in range(7):
+            dt = st + timedelta(days=i)
+            items = by_day.get(dt, [])
+            for s in items:
+                ss = str_to_dt(s["start"])
+                ee = str_to_dt(s["end"])
+                start_hour = ss.hour + ss.minute / 60 + ss.second / 3600
+                end_hour = ee.hour + ee.minute / 60 + ee.second / 3600
+                if end_hour <= self.view_start_hour or start_hour >= view_end:
+                    continue
+                y1 = grid.top() + (max(self.view_start_hour, start_hour) - self.view_start_hour) / self.visible_hours * grid.height()
+                y2 = grid.top() + (min(view_end, end_hour) - self.view_start_hour) / self.visible_hours * grid.height()
+                if y2 < y1 + 20:
+                    y2 = y1 + 20
+                x = grid.left() + hour_w + i * col_w + 6
+                rect = QRectF(x, y1 + 4, col_w - 12, max(18.0, y2 - y1 - 8))
+                col = color_for_category(s["category"])
+                focused = self._is_focused_item(s)
+                if focused:
+                    p.setPen(QPen(QColor(255, 255, 255, 235), 2.4))
+                    p.setBrush(Qt.NoBrush)
+                    p.drawRoundedRect(rect.adjusted(-2, -2, 2, 2), 14, 14)
+                if s.get("source") == "plan":
+                    p.setPen(QPen(QColor(col.red(), col.green(), col.blue(), 220), 2.2 if focused else 1.3, Qt.DashLine))
+                    p.setBrush(QColor(col.red(), col.green(), col.blue(), 58 if focused else 52))
+                else:
+                    p.setPen(QPen(QColor(255, 255, 255, 190 if focused else 145), 1.8 if focused else 1.0))
+                    p.setBrush(QColor(col.red(), col.green(), col.blue(), 112 if focused else 98))
+                p.drawRoundedRect(rect, 12, 12)
+                p.setPen(QColor(TEXT.red(), TEXT.green(), TEXT.blue(), 225))
+                p.setFont(ui_font(self, 9, QFont.Bold))
+                p.drawText(rect.adjusted(8, 4, -8, -18), Qt.TextWordWrap, self._item_title_text(s)[:28])
+                p.setFont(ui_font(self, 8))
+                p.drawText(rect.adjusted(8, rect.height() - 18, -8, -4), Qt.AlignLeft | Qt.AlignBottom, f"{ss.strftime('%H:%M')}-{ee.strftime('%H:%M')}")
+                hit = dict(s)
+                hit["rect"] = rect
+                self._item_hits.append(hit)
+
+        if self._duplicate_drag_rect is not None and self._duplicate_drag_hit is not None and self._duplicate_drag_start is not None and self._duplicate_drag_end is not None:
+            col = color_for_category(self._duplicate_drag_hit.get("category", "Other"))
+            rect = self._duplicate_drag_rect
+            p.setPen(QPen(QColor(255, 255, 255, 235), 2.0, Qt.DashLine))
+            p.setBrush(QColor(col.red(), col.green(), col.blue(), 42))
+            p.drawRoundedRect(rect, 12, 12)
+            p.setPen(QColor(TEXT.red(), TEXT.green(), TEXT.blue(), 220))
+            p.setFont(ui_font(self, 9, QFont.Bold))
+            p.drawText(rect.adjusted(8, 4, -8, -18), Qt.TextWordWrap, self._item_title_text(self._duplicate_drag_hit)[:28])
+            p.setFont(ui_font(self, 8))
+            p.drawText(rect.adjusted(8, rect.height() - 18, -8, -4), Qt.AlignLeft | Qt.AlignBottom, f"{self._duplicate_drag_start.strftime('%H:%M')}-{self._duplicate_drag_end.strftime('%H:%M')}")
+
+    def _paint_day(self, p: QPainter, area: QRectF):
+        d0 = start_of_day(self.selected_date)
+        d1 = end_of_day(self.selected_date)
+        sessions = self._combined_items_in_range(d0, d1)
+        self._week_day_rects = [(area, self.selected_date)]
+
+        header = QRectF(area.left(), area.top(), area.width(), 40)
+        p.setPen(QColor(TEXT.red(), TEXT.green(), TEXT.blue(), 230))
+        p.setFont(ui_font(self, 13, QFont.Bold))
+        p.drawText(header, Qt.AlignCenter, self.selected_date.strftime("%Y-%m-%d  %A"))
+
+        grid = QRectF(area.left(), area.top() + 48, area.width(), area.height() - 48)
+        self._grid_rect = grid
+        label_w = 82
+        content_x = grid.left() + label_w
+
+        p.setPen(QPen(QColor(TEXT.red(), TEXT.green(), TEXT.blue(), 36), 1))
+        for idx in range(int(self.visible_hours) + 1):
+            hour = self.view_start_hour + idx
+            y = grid.top() + (hour - self.view_start_hour) / max(0.0001, self.visible_hours) * grid.height()
+            if y < grid.top() - 20 or y > grid.bottom() + 20:
+                continue
+            p.drawLine(int(content_x), int(y), int(grid.right()), int(y))
+            p.setPen(QColor(SUBTEXT.red(), SUBTEXT.green(), SUBTEXT.blue(), 180))
+            p.setFont(ui_font(self, 11))
+            p.drawText(QRectF(grid.left(), y - 10, label_w - 10, 24), Qt.AlignRight | Qt.AlignVCenter, self._fmt_axis_time(hour))
+            p.setPen(QPen(QColor(TEXT.red(), TEXT.green(), TEXT.blue(), 36), 1))
+
+        view_end = self.view_start_hour + self.visible_hours
+        for s in sessions:
+            ss = str_to_dt(s["start"])
+            ee = str_to_dt(s["end"])
+            start_h = ss.hour + ss.minute / 60 + ss.second / 3600
+            end_h = ee.hour + ee.minute / 60 + ee.second / 3600
+            if end_h <= self.view_start_hour or start_h >= view_end:
+                continue
+            y1 = grid.top() + (max(self.view_start_hour, start_h) - self.view_start_hour) / self.visible_hours * grid.height()
+            y2 = grid.top() + (min(view_end, end_h) - self.view_start_hour) / self.visible_hours * grid.height()
+            visible_h = max(4.0, y2 - y1)
+            box_h = max(24.0, visible_h - 12)
+            rect_y = y1 + 6
+            if visible_h < 36:
+                if end_h > view_end and start_h >= self.view_start_hour:
+                    rect_y = y1 + 6
+                elif start_h < self.view_start_hour and end_h <= view_end:
+                    rect_y = y2 - box_h - 6
+                else:
+                    rect_y = y1 + max(2.0, (visible_h - box_h) * 0.5)
+            rect = QRectF(content_x + 10, rect_y, grid.width() - label_w - 20, box_h)
+            col = color_for_category(s["category"])
+            focused = self._is_focused_item(s)
+            if focused:
+                p.setPen(QPen(QColor(255, 255, 255, 235), 2.4))
+                p.setBrush(Qt.NoBrush)
+                p.drawRoundedRect(rect.adjusted(-2, -2, 2, 2), 14, 14)
+            if s.get("source") == "plan":
+                p.setPen(QPen(QColor(col.red(), col.green(), col.blue(), 220), 2.2 if focused else 1.4, Qt.DashLine))
+                p.setBrush(QColor(col.red(), col.green(), col.blue(), 56 if focused else 50))
+            else:
+                p.setPen(QPen(QColor(255, 255, 255, 190 if focused else 150), 1.8 if focused else 1.1))
+                p.setBrush(QColor(col.red(), col.green(), col.blue(), 108 if focused else 92))
+            p.drawRoundedRect(rect, 12, 12)
+            p.setBrush(col)
+            p.setPen(Qt.NoPen)
+            p.drawRoundedRect(QRectF(rect.left() + 8, rect.top() + 8, 4, rect.height() - 16), 2, 2)
+            p.setPen(QColor(TEXT.red(), TEXT.green(), TEXT.blue(), 230))
+            p.setFont(ui_font(self, 11, QFont.Bold))
+            p.drawText(rect.adjusted(18, 8, -10, -28), Qt.TextWordWrap, self._item_title_text(s))
+            p.setFont(ui_font(self, 9))
+            p.drawText(rect.adjusted(18, rect.height() - 24, -10, -8), Qt.AlignLeft | Qt.AlignBottom, f"{ss.strftime('%H:%M')}-{ee.strftime('%H:%M')}   {normalize_category(s['category'])}")
+            hit = dict(s)
+            hit["rect"] = rect
+            self._item_hits.append(hit)
+
+
+# ---------------- task list ----------------
+class TaskTableCard(LightGlassCard):
+    def __init__(self, parent=None):
+        super().__init__(radius=28, parent=parent)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 16, 16, 16)
+        lay.setSpacing(8)
+
+        self.title = QLabel("Task Details")
+        self.title.setStyleSheet("color:rgba(33,42,60,235); font-weight:800;")
+        lay.addWidget(self.title)
+
+        self.table = QTableWidget(0, 7)
+        self.table.setHorizontalHeaderLabels(["Source", "ID", "Start", "End", "Duration", "Type", "Task"])
+        self.table.setColumnHidden(0, True)
+        self.table.setColumnHidden(1, True)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(6, QHeaderView.Stretch)
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.setStyleSheet(
+            '''
+            QTableWidget{
+                background:rgba(255,255,255,74);
+                color:rgba(33,42,60,235);
+                border:1px solid rgba(255,255,255,165);
+                border-radius:14px;
+                gridline-color:rgba(100,110,125,40);
+                selection-background-color:rgba(176,182,192,118);
+                selection-color:rgba(33,42,60,235);
+            }
+            QHeaderView::section{
+                background:rgba(255,255,255,56);
+                color:rgba(33,42,60,235);
+                border:0;
+                padding:6px;
+                font-weight:800;
+            }
+            QTableWidget::item:selected{
+                background:rgba(176,182,192,118);
+                color:rgba(33,42,60,235);
+            }
+            '''
+        )
+        lay.addWidget(self.table, 1)
+
+
+# ---------------- main window ----------------
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.db = TrackerDB(db_path())
+        self.categories = self._load_categories()
+        self.selected_date = start_of_day(now_local())
+        self.running: RunningSession | None = None
+        self.window_locked = self.db.get_state("window_locked", "0") == "1"
+        self._win_style_applied = False
+        self._quitting = False
+        self._start_hidden_to_tray = "--tray" in sys.argv
+        self.range_stats_scope_mode = StatsWidget.SCOPE_MONTH
+
+        self.setWindowTitle(APP_NAME)
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        icon_path = app_icon_path()
+        if icon_path:
+            self.setWindowIcon(QIcon(icon_path))
+        self._set_initial_centered_geometry()
+        self._build_ui()
+        self._setup_tray()
+        ensure_windows_autostart()
+        self._apply_dynamic_scale()
+        apply_rounded_window_mask(self, 34)
+
+        self._tick_timer = QTimer(self)
+        self._tick_timer.setInterval(200)
+        self._tick_timer.timeout.connect(self._tick)
+        self._tick_timer.start()
+
+        self.refresh_all()
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        apply_rounded_window_mask(self, 34)
+        if not self._win_style_applied:
+            self._win_style_applied = True
+            QTimer.singleShot(0, lambda: apply_windows_toolwindow_style(self))
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._apply_dynamic_scale()
+        apply_rounded_window_mask(self, 34)
+
+    def closeEvent(self, e):
+        self._save_window_state()
+        if getattr(self, "tray", None) is not None and self.tray.isVisible() and not self._quitting:
+            self.hide()
+            e.ignore()
+            return
+        try:
+            self.db.close()
+        except Exception:
+            pass
+        super().closeEvent(e)
+
+    def _ensure_visible_on_screen(self):
+        g = self.geometry()
+        app = QApplication.instance()
+        screen = app.screenAt(g.center()) if app is not None else None
+        if screen is None:
+            screen = QApplication.primaryScreen()
+        if screen is None:
+            return
+
+        avail = screen.availableGeometry()
+        min_w = min(900, max(320, avail.width()))
+        min_h = min(600, max(240, avail.height()))
+        w = min(max(g.width(), min_w), avail.width())
+        h = min(max(g.height(), min_h), avail.height())
+
+        x = g.x()
+        y = g.y()
+        if x + 80 > avail.right() or x + w - 80 < avail.x():
+            x = avail.x() + (avail.width() - w) // 2
+        if y + 80 > avail.bottom() or y + h - 80 < avail.y():
+            y = avail.y() + (avail.height() - h) // 2
+
+        x = max(avail.x(), min(x, avail.right() - w + 1))
+        y = max(avail.y(), min(y, avail.bottom() - h + 1))
+        self.setGeometry(x, y, w, h)
+
+    def _set_initial_centered_geometry(self):
+        saved = self.db.get_state("main_geometry", "")
+        if saved:
+            try:
+                x, y, w, h = [int(v) for v in saved.split(",")]
+                self.setGeometry(x, y, w, h)
+                self._ensure_visible_on_screen()
+                return
+            except Exception:
+                pass
+        screen = QApplication.primaryScreen()
+        if not screen:
+            self.setGeometry(120, 80, 1450, 860)
+            self._ensure_visible_on_screen()
+            return
+        avail = screen.availableGeometry()
+        w = max(1280, int(avail.width() * 0.82))
+        h = max(800, int(avail.height() * 0.82))
+        w = min(w, int(avail.width() * 0.95))
+        h = min(h, int(avail.height() * 0.93))
+        x = avail.x() + (avail.width() - w) // 2
+        y = avail.y() + (avail.height() - h) // 2
+        self.setGeometry(x, y, w, h)
+        self._ensure_visible_on_screen()
+
+    def _load_categories(self):
+        raw = self.db.get_state("categories", "")
+        if raw:
+            try:
+                cats = json.loads(raw)
+                if isinstance(cats, list) and cats:
+                    return [str(x) for x in cats]
+            except Exception:
+                pass
+        self.db.set_state("categories", json.dumps(DEFAULT_CATEGORIES, ensure_ascii=False))
+        return DEFAULT_CATEGORIES[:]
+
+    def ui_scale(self) -> float:
+        w = max(900.0, float(self.width() or BASE_WIDTH))
+        h = max(600.0, float(self.height() or BASE_HEIGHT))
+        return max(0.72, min(1.45, min(w / BASE_WIDTH, h / BASE_HEIGHT)))
+
+    def _save_window_state(self):
+        g = self.geometry()
+        self.db.set_state("main_geometry", f"{g.x()},{g.y()},{g.width()},{g.height()}")
+        self.db.set_state("window_locked", "1" if self.window_locked else "0")
+
+    def _setup_tray(self):
+        self.tray = QSystemTrayIcon(self)
+        icon_path = app_icon_path()
+        self.tray.setIcon(QIcon(icon_path) if icon_path else self.windowIcon())
+        menu = QMenu(self)
+        act_show = menu.addAction("Show")
+        act_hide = menu.addAction("Hide")
+        menu.addSeparator()
+        act_quit = menu.addAction("Quit")
+        act_show.triggered.connect(self.show_from_tray)
+        act_hide.triggered.connect(self.hide)
+        act_quit.triggered.connect(self.quit_from_tray)
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(self._on_tray_activated)
+        self.tray.show()
+
+    def _on_tray_activated(self, reason):
+        if reason in (QSystemTrayIcon.DoubleClick, QSystemTrayIcon.Trigger):
+            self.show_from_tray()
+
+    def show_from_tray(self):
+        self._ensure_visible_on_screen()
+        state = self.windowState()
+        state = state & ~Qt.WindowMinimized
+        self.setWindowState(state)
+        self.showNormal()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        QTimer.singleShot(0, self.raise_)
+        QTimer.singleShot(0, self.activateWindow)
+
+    def quit_from_tray(self):
+        self._quitting = True
+        self._save_window_state()
+        self.hide()
+        if getattr(self, "tray", None) is not None:
+            self.tray.hide()
+        self.close()
+        QApplication.instance().quit()
+
+    def _apply_dynamic_scale(self):
+        if not hasattr(self, "title_bar"):
+            return
+        scale = self.ui_scale()
+        base_font = ui_font(self, 10.5)
+        if self.centralWidget() is not None:
+            self.centralWidget().setFont(base_font)
+
+        def apply_scaled_font(widget, fallback_size: float | None = None):
+            if widget is None:
+                return
+            f = widget.font()
+            base_pt = widget.property("_base_point_size")
+            if base_pt is None:
+                base_pt = f.pointSizeF() if f.pointSizeF() > 0 else (fallback_size or 10.5)
+                widget.setProperty("_base_point_size", float(base_pt))
+            f.setPointSizeF(max(1.0, float(base_pt) * scale))
+            widget.setFont(f)
+
+        self.title_bar.apply_scale()
+        for btn in (self.btn_month, self.btn_week, self.btn_day):
+            btn.setFixedHeight(sp(self, 34))
+            apply_scaled_font(btn, 10.5)
+        apply_scaled_font(self.timer.btn, 11)
+        apply_scaled_font(self.task_card.title, 12)
+        apply_scaled_font(self.task_card.table, 10)
+        apply_scaled_font(self.task_card.table.horizontalHeader(), 10)
+        apply_scaled_font(self.task_card.table.verticalHeader(), 10)
+        self.task_card.table.verticalHeader().setDefaultSectionSize(sp(self, 28))
+        for btn, fallback in (
+            (getattr(self.stats, "btn_summary_toggle", None), 8.2),
+            (getattr(self.stats, "btn_day_scope", None), 7.8),
+            (getattr(self.stats, "btn_week_scope", None), 7.8),
+            (getattr(self.stats, "btn_month_scope", None), 7.8),
+        ):
+            if btn is not None:
+                apply_scaled_font(btn, fallback)
+
+        for widget, fallback in (
+            (getattr(self.title_bar, "lbl", None), 17),
+            (getattr(self.title_bar, "btn_pin", None), 8.8),
+            (getattr(self.title_bar, "btn_close", None), 8.0),
+        ):
+            apply_scaled_font(widget, fallback)
+
+        self.calendar.update()
+        self.timer.update()
+        self.stats.update()
+
+    def is_window_locked(self) -> bool:
+        return bool(self.window_locked)
+
+    def set_window_locked(self, locked: bool):
+        self.window_locked = bool(locked)
+        self.db.set_state("window_locked", "1" if self.window_locked else "0")
+        if hasattr(self, "title_bar"):
+            self.title_bar.refresh_lock_button()
+
+    def toggle_window_locked(self):
+        self.set_window_locked(not self.window_locked)
+
+    def _build_ui(self):
+        bg = LightWallpaperBackground()
+        self.setCentralWidget(bg)
+
+        outer = QVBoxLayout(bg)
+        outer.setContentsMargins(10, 10, 10, 10)
+        outer.setSpacing(12)
+        self.title_bar = TitleBar(self)
+        outer.addWidget(self.title_bar)
+
+        body = QHBoxLayout()
+        body.setSpacing(12)
+        outer.addLayout(body, 1)
+
+        # left / calendar
+        self.calendar = CalendarCanvas()
+        self.calendar.set_sessions_callback(self._sessions_in_range)
+        self.calendar.set_plans_callback(self._plans_in_range)
+        self.calendar.on_selected_date_changed = self._on_calendar_selected_date_changed
+        self.calendar.on_mode_changed = self._on_calendar_mode_changed
+        self.calendar.on_edit_session = self.edit_session_by_id
+        self.calendar.on_edit_plan = self.edit_plan_by_id
+        self.calendar.on_add_plan_requested = self.add_planned_item
+        self.calendar.on_pick_month_year = self.pick_calendar_month
+        self.calendar.on_duplicate_item_requested = self.duplicate_calendar_item
+        self.calendar.on_delete_item_requested = self.delete_calendar_item
+
+        left_wrap = QVBoxLayout()
+        left_wrap.setContentsMargins(0, 0, 0, 0)
+        left_wrap.setSpacing(0)
+
+        self.left_card = self.calendar
+        body.addWidget(self.left_card, 7)
+
+        # right column
+        right_col = QVBoxLayout()
+        right_col.setContentsMargins(0, 0, 0, 0)
+        right_col.setSpacing(12)
+        body.addLayout(right_col, 5)
+
+        # toolbar buttons
+        ctrl_row = QHBoxLayout()
+        ctrl_row.setSpacing(8)
+        self.btn_month = QPushButton("Month")
+        self.btn_week = QPushButton("Week")
+        self.btn_day = QPushButton("Day")
+        for btn in (self.btn_month, self.btn_week, self.btn_day):
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setFixedHeight(34)
+            ctrl_row.addWidget(btn)
+        ctrl_row.addStretch(1)
+        right_col.addLayout(ctrl_row)
+
+        self.btn_month.clicked.connect(lambda: self.calendar.set_mode(CalendarCanvas.MODE_MONTH))
+        self.btn_week.clicked.connect(lambda: self.calendar.set_mode(CalendarCanvas.MODE_WEEK))
+        self.btn_day.clicked.connect(lambda: self.calendar.set_mode(CalendarCanvas.MODE_DAY))
+
+        top_row = QHBoxLayout()
+        top_row.setSpacing(12)
+        right_col.addLayout(top_row, 3)
+
+        self.timer = TimerWidget()
+        self.timer.on_start = self.start_timer
+        self.timer.on_stop = self.stop_timer
+        top_row.addWidget(self.timer, 1)
+
+        stats_col = QVBoxLayout()
+        stats_col.setContentsMargins(0, 0, 0, 0)
+        stats_col.setSpacing(12)
+        top_row.addLayout(stats_col, 1)
+
+        self.stats = StatsWidget()
+        self.stats.set_summary_scope_mode(self.range_stats_scope_mode, emit=False)
+        self.stats.on_summary_scope_changed = self._on_range_stats_scope_changed
+        stats_col.addWidget(self.stats, 1)
+
+        self.task_card = TaskTableCard()
+        right_col.addWidget(self.task_card, 2)
+
+        self.task_card.table.customContextMenuRequested.connect(self._on_table_menu)
+        self.task_card.table.cellClicked.connect(self._on_table_cell_clicked)
+        self.task_card.table.cellDoubleClicked.connect(lambda r, c: self._edit_row(r))
+        self.task_card.table.installEventFilter(self)
+
+        grip_row = QHBoxLayout()
+        grip_row.addStretch(1)
+        grip = QSizeGrip(bg)
+        grip.setFixedSize(18, 18)
+        grip_row.addWidget(grip)
+        outer.addLayout(grip_row)
+
+        self._update_mode_buttons(self.calendar.mode)
+
+    def _update_mode_buttons(self, mode: int):
+        self.btn_month.setStyleSheet(glass_button_style(active=(mode == CalendarCanvas.MODE_MONTH)))
+        self.btn_week.setStyleSheet(glass_button_style(active=(mode == CalendarCanvas.MODE_WEEK)))
+        self.btn_day.setStyleSheet(glass_button_style(active=(mode == CalendarCanvas.MODE_DAY)))
+
+    def _on_calendar_mode_changed(self, mode: int):
+        self._update_mode_buttons(mode)
+
+    def _on_calendar_selected_date_changed(self, dt: datetime):
+        self.selected_date = start_of_day(dt)
+        self.refresh_all()
+
+    def _sessions_in_range(self, start_dt: datetime, end_dt: datetime):
+        return self.db.get_sessions_in_range(start_dt, end_dt)
+
+    def _sessions_for_selected_day(self):
+        return self.db.get_sessions_in_range(start_of_day(self.selected_date), end_of_day(self.selected_date))
+
+    def _plans_in_range(self, start_dt: datetime, end_dt: datetime):
+        return self.db.get_plans_in_range(start_dt, end_dt)
+
+    def _items_for_selected_day(self):
+        day_start = start_of_day(self.selected_date)
+        day_end = end_of_day(self.selected_date)
+        items = []
+        for s in self._sessions_for_selected_day():
+            x = dict(s)
+            x["source"] = "session"
+            x = clamp_item_to_range(x, day_start, day_end)
+            if x is not None:
+                items.append(x)
+        for s in self._plans_in_range(day_start, day_end):
+            x = dict(s)
+            x["source"] = "plan"
+            x = clamp_item_to_range(x, day_start, day_end)
+            if x is not None:
+                items.append(x)
+        items.sort(key=lambda item: item.get("start", ""))
+        return items
+
+    def _items_in_range(self, range_start: datetime, range_end: datetime):
+        items = []
+        for s in self._sessions_in_range(range_start, range_end):
+            x = dict(s)
+            x["source"] = "session"
+            x = clamp_item_to_range(x, range_start, range_end)
+            if x is not None:
+                items.append(x)
+        for s in self._plans_in_range(range_start, range_end):
+            x = dict(s)
+            x["source"] = "plan"
+            x = clamp_item_to_range(x, range_start, range_end)
+            if x is not None:
+                items.append(x)
+        items.sort(key=lambda item: item.get("start", ""))
+        return items
+
+    def _scope_range(self, scope_mode: str) -> tuple[datetime, datetime]:
+        if scope_mode == StatsWidget.SCOPE_DAY:
+            return start_of_day(self.selected_date), end_of_day(self.selected_date)
+        if scope_mode == StatsWidget.SCOPE_WEEK:
+            st = week_start(self.selected_date)
+            return st, st + timedelta(days=6, hours=23, minutes=59, seconds=59)
+        st = month_start(self.selected_date)
+        return st, add_months(st, 1) - timedelta(seconds=1)
+
+    def _refresh_range_stats(self):
+        if not hasattr(self, "stats"):
+            return
+        range_start, range_end = self._scope_range(self.range_stats_scope_mode)
+        scope_items = self._items_in_range(range_start, range_end)
+        self.stats.set_summary_items(self.selected_date, scope_items)
+
+    def _on_range_stats_scope_changed(self, mode: str):
+        self.range_stats_scope_mode = mode
+        self._refresh_range_stats()
+
+    def start_timer(self):
+        if self.running:
+            return
+        self.running = RunningSession(start_dt=now_local(), start_monotonic=time.monotonic())
+        self.timer.set_running(True)
+
+    def stop_timer(self):
+        if not self.running:
+            return
+        start_dt = self.running.start_dt
+        end_dt = now_local()
+        self.running = None
+        self.timer.set_running(False)
+
+        dlg = TaskDialog(self, start_dt, end_dt, self.categories, title="Log Task")
+        dlg.move(self.geometry().center() - dlg.rect().center())
+        if dlg.exec() == QDialog.Accepted:
+            self.db.add_session(start_dt, end_dt, dlg.category(), dlg.task_text())
+            self.selected_date = start_of_day(start_dt)
+            self.calendar.set_selected_date(self.selected_date)
+            self.refresh_all()
+
+    def add_planned_item(self, start_dt: datetime | None = None, end_dt: datetime | None = None):
+        base = start_of_day(self.selected_date)
+        start_dt = start_dt or base.replace(hour=9, minute=0)
+        end_dt = end_dt or (start_dt + timedelta(hours=1))
+        dlg = PlanDialog(self, start_dt, end_dt, self.categories, title="Add Planned Task")
+        dlg.move(self.geometry().center() - dlg.rect().center())
+        if dlg.exec() == QDialog.Accepted:
+            self.db.add_plan(dlg.start_datetime(), dlg.end_datetime(), dlg.category(), dlg.task_text())
+            self.selected_date = start_of_day(dlg.start_datetime())
+            self.calendar.set_selected_date(self.selected_date)
+            self.refresh_all()
+
+    def edit_plan_by_id(self, pid: int):
+        sess = self.db.get_plan_by_id(pid)
+        if not sess:
+            return
+        start_dt = str_to_dt(sess["start"])
+        end_dt = str_to_dt(sess["end"])
+        dlg = PlanDialog(
+            self,
+            start_dt,
+            end_dt,
+            self.categories,
+            preset_cat=normalize_category(sess["category"]),
+            preset_task=normalize_task_text(sess["task_text"]),
+            title=f"Edit Planned Task (ID {pid})",
+        )
+        dlg.move(self.geometry().center() - dlg.rect().center())
+        if dlg.exec() == QDialog.Accepted:
+            self.db.update_plan(pid, dlg.start_datetime(), dlg.end_datetime(), dlg.category(), dlg.task_text())
+            self.selected_date = start_of_day(dlg.start_datetime())
+            self.calendar.set_selected_date(self.selected_date)
+            self.refresh_all()
+
+    def _tick(self):
+        if self.running:
+            self.timer.set_elapsed(int(time.monotonic() - self.running.start_monotonic))
+        else:
+            self.timer.set_elapsed(0)
+
+    def refresh_table(self, sessions):
+        table = self.task_card.table
+        table.setRowCount(0)
+        for s in sessions:
+            st = str_to_dt(s["start"]).strftime("%H:%M")
+            en = str_to_dt(s["end"]).strftime("%H:%M")
+            source = str(s.get("source", "session"))
+            type_text = normalize_category(s["category"])
+            values = [source, s["id"], st, en, fmt_hms(s["duration_sec"]), type_text, normalize_task_text(s["task_text"])]
+            row = table.rowCount()
+            table.insertRow(row)
+            for col, val in enumerate(values):
+                item = QTableWidgetItem(str(val))
+                if col == 5:
+                    c = color_for_category(str(s["category"]))
+                    item.setBackground(QColor(c.red(), c.green(), c.blue(), 62 if source == "plan" else 88))
+                table.setItem(row, col, item)
+
+    def _edit_row(self, row: int):
+        source_item = self.task_card.table.item(row, 0)
+        sid_item = self.task_card.table.item(row, 1)
+        if source_item and sid_item:
+            if source_item.text() == "plan":
+                self.edit_plan_by_id(int(sid_item.text()))
+            else:
+                self.edit_session_by_id(int(sid_item.text()))
+
+    def _focus_row_in_calendar(self, row: int):
+        table = self.task_card.table
+        source_item = table.item(row, 0)
+        sid_item = table.item(row, 1)
+        start_item = table.item(row, 2)
+        if not source_item or not sid_item or not start_item:
+            return
+        try:
+            # Hidden row source/id are authoritative; selected day already scopes the date.
+            refs = self._items_for_selected_day()
+            source = source_item.text()
+            sid = int(sid_item.text())
+            target = next((x for x in refs if str(x.get("source", "session")) == source and int(x.get("id", -1)) == sid), None)
+            if target:
+                self.selected_date = start_of_day(str_to_dt(target["start"]))
+                self.calendar.set_selected_date(self.selected_date)
+                self.calendar.set_focus_item(source, sid)
+                self.calendar.update()
+        except Exception:
+            pass
+
+    def _on_table_cell_clicked(self, row: int, col: int):
+        if col == 6:
+            self._focus_row_in_calendar(row)
+
+    def _selected_row_refs(self) -> list[tuple[str, int]]:
+        table = self.task_card.table
+        rows = sorted({idx.row() for idx in table.selectionModel().selectedRows()})
+        refs = []
+        for row in rows:
+            source_item = table.item(row, 0)
+            id_item = table.item(row, 1)
+            if source_item and id_item:
+                refs.append((source_item.text(), int(id_item.text())))
+        return refs
+
+    def _delete_selected_refs(self, refs: list[tuple[str, int]]):
+        if not refs:
+            return
+        label = "item" if len(refs) == 1 else "items"
+        if QMessageBox.question(self, "Confirm Delete", f"Delete {len(refs)} selected {label}?") != QMessageBox.Yes:
+            return
+        for source, rid in refs:
+            if source == "plan":
+                self.db.delete_plan(rid)
+            else:
+                self.db.delete_session(rid)
+        self.refresh_all()
+
+    def _on_table_menu(self, pos):
+        table = self.task_card.table
+        row = table.rowAt(pos.y())
+        selected_rows = {idx.row() for idx in table.selectionModel().selectedRows()}
+        if row >= 0 and row not in selected_rows:
+            table.clearSelection()
+            table.selectRow(row)
+
+        selected_refs = self._selected_row_refs()
+        if not selected_refs:
+            return
+
+        menu = QMenu(self)
+        act_edit = menu.addAction("Edit")
+        if len(selected_refs) != 1:
+            act_edit.setEnabled(False)
+        act_del = menu.addAction("Delete Selected" if len(selected_refs) > 1 else "Delete")
+        action = menu.exec(table.mapToGlobal(pos))
+        if action == act_edit and len(selected_refs) == 1:
+            source, rid = selected_refs[0]
+            if source == "plan":
+                self.edit_plan_by_id(rid)
+            else:
+                self.edit_session_by_id(rid)
+        elif action == act_del:
+            self._delete_selected_refs(selected_refs)
+
+    def request_delete_selected(self):
+        self._delete_selected_refs(self._selected_row_refs())
+
+    def eventFilter(self, obj, event):
+        if obj is self.task_card.table and event.type() == QEvent.KeyPress and event.key() == Qt.Key_Delete:
+            self.request_delete_selected()
+            return True
+        return super().eventFilter(obj, event)
+
+    def pick_calendar_month(self, current_dt: datetime):
+        dlg = DateJumpDialog(self, current_dt)
+        dlg.move(self.geometry().center() - dlg.rect().center())
+        if dlg.exec() == QDialog.Accepted:
+            picked = dlg.selected_datetime()
+            self.selected_date = start_of_day(picked)
+            self.calendar.set_selected_date(self.selected_date)
+            self.refresh_all()
+
+    def edit_session_by_id(self, sid: int):
+        sess = self.db.get_session_by_id(sid)
+        if not sess:
+            return
+        start_dt = str_to_dt(sess["start"])
+        end_dt = str_to_dt(sess["end"])
+        dlg = PlanDialog(
+            self,
+            start_dt,
+            end_dt,
+            self.categories,
+            preset_cat=normalize_category(sess["category"]),
+            preset_task=normalize_task_text(sess["task_text"]),
+            title=f"Edit Task (ID {sid})",
+        )
+        dlg.move(self.geometry().center() - dlg.rect().center())
+        if dlg.exec() == QDialog.Accepted:
+            new_start = dlg.start_datetime()
+            new_end = dlg.end_datetime()
+            self.db.update_session(sid, new_start, new_end, dlg.category(), dlg.task_text())
+            self.selected_date = start_of_day(new_start)
+            self.calendar.set_selected_date(self.selected_date)
+            self.calendar.set_focus_item("session", sid)
+            self.refresh_all()
+
+    def duplicate_calendar_item(self, item: dict, start_dt: datetime, end_dt: datetime):
+        if end_dt <= start_dt:
+            return None
+        source = str(item.get("source", "plan"))
+        category = normalize_category(item.get("category", DEFAULT_CATEGORIES[0]))
+        task_text = normalize_task_text(item.get("task_text", ""))
+        if source == "session":
+            new_id = self.db.add_session(start_dt, end_dt, category, task_text)
+        else:
+            new_id = self.db.add_plan(start_dt, end_dt, category, task_text)
+        self.selected_date = start_of_day(start_dt)
+        self.calendar.set_selected_date(self.selected_date)
+        self.calendar.set_focus_item(source, new_id)
+        self.refresh_all()
+        return (source, new_id)
+
+    def delete_calendar_item(self, source: str, rid: int):
+        if source == "plan":
+            self.db.delete_plan(int(rid))
+        else:
+            self.db.delete_session(int(rid))
+        self.calendar.set_focus_item(None, None)
+        self.refresh_all()
+
+    def refresh_all(self):
+        items = self._items_for_selected_day()
+        self.refresh_table(items)
+        self.stats.set_day_items(self.selected_date, items)
+        self._refresh_range_stats()
+        self.calendar.update()
+        self.task_card.title.setText(f"Task Details  ·  {self.selected_date.strftime('%Y-%m-%d')}")
+        self._apply_dynamic_scale()
+
+
+def main():
+    if not ensure_single_instance():
+        return
+    hide_windows_console()
+    app = QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
+    icon_path = app_icon_path()
+    if icon_path:
+        app.setWindowIcon(QIcon(icon_path))
+    w = MainWindow()
+    if w._start_hidden_to_tray:
+        w.hide()
+    else:
+        w.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
