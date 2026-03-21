@@ -45,6 +45,8 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
+    QColorDialog,
+    QSlider,
     QSizeGrip,
     QSystemTrayIcon,
     QTableWidget,
@@ -58,6 +60,7 @@ from PySide6.QtWidgets import (
 APP_NAME = "Time Tracker :)"
 DEFAULT_CATEGORIES = ["Work", "Study", "Meal", "Fun", "Commute", "Exercise", "Rest", "Other"]
 DEFAULT_TASK_PLACEHOLDER = "(No details)"
+CURRENT_CATEGORY_ORDER: list[str] = DEFAULT_CATEGORIES[:]
 
 CATEGORY_ALIASES = {
     "工作": "Work",
@@ -78,8 +81,10 @@ CATEGORY_ALIASES = {
     "Other": "Other",
 }
 
-MINT = QColor(134, 231, 220)
-PURPLE = QColor(107, 113, 217)
+DEFAULT_MINT = QColor(134, 231, 220)
+DEFAULT_PURPLE = QColor(107, 113, 217)
+MINT = QColor(DEFAULT_MINT)
+PURPLE = QColor(DEFAULT_PURPLE)
 TEXT = QColor(33, 42, 60)
 SUBTEXT = QColor(90, 100, 120)
 WEEKEND = QColor(191, 132, 139)
@@ -87,7 +92,9 @@ WEEKEND = QColor(191, 132, 139)
 BASE_WIDTH = 1450.0
 BASE_HEIGHT = 860.0
 
-CALENDAR_GLASS_OPACITY_SCALE = 1.18
+DEFAULT_GLASS_OPACITY_SCALE = 1.18
+CALENDAR_GLASS_OPACITY_SCALE = DEFAULT_GLASS_OPACITY_SCALE
+CURRENT_GLASS_OPACITY_SCALE = DEFAULT_GLASS_OPACITY_SCALE
 
 
 def ui_scale_for(widget) -> float:
@@ -290,6 +297,80 @@ def blend(c1: QColor, c2: QColor, t: float, alpha: int | None = None) -> QColor:
     return QColor(r, g, b, a)
 
 
+def clamp_glass_opacity_scale(scale: float) -> float:
+    try:
+        value = float(scale)
+    except Exception:
+        value = DEFAULT_GLASS_OPACITY_SCALE
+    return max(0.70, min(1.85, value))
+
+
+def scaled_alpha(alpha: int, scale: float | None = None) -> int:
+    base = max(0, int(alpha))
+    scale = clamp_glass_opacity_scale(CURRENT_GLASS_OPACITY_SCALE if scale is None else scale)
+    return max(0, min(255, int(round(base * scale))))
+
+
+def glass_scale_for(widget=None) -> float:
+    try:
+        if widget is not None:
+            win = widget.window()
+            if win is not None and hasattr(win, "glass_opacity_scale"):
+                return clamp_glass_opacity_scale(getattr(win, "glass_opacity_scale"))
+    except Exception:
+        pass
+    return clamp_glass_opacity_scale(CURRENT_GLASS_OPACITY_SCALE)
+
+
+def ga(widget, alpha: int) -> int:
+    return scaled_alpha(alpha, glass_scale_for(widget))
+
+
+def color_with_alpha(color: QColor, alpha: int, widget=None) -> QColor:
+    if widget is None:
+        return QColor(color.red(), color.green(), color.blue(), scaled_alpha(alpha))
+    return QColor(color.red(), color.green(), color.blue(), ga(widget, alpha))
+
+
+def css_rgba(color: QColor, alpha: int, scale: float | None = None) -> str:
+    return f"rgba({color.red()},{color.green()},{color.blue()},{scaled_alpha(alpha, scale)})"
+
+
+def color_to_hex(color: QColor) -> str:
+    return color.name().upper()
+
+
+def parse_color(value: str, fallback: QColor) -> QColor:
+    c = QColor(str(value or "").strip())
+    return c if c.isValid() else QColor(fallback)
+
+
+def rebuild_category_colors(categories=None) -> dict[str, QColor]:
+    global CAT_COLORS, CURRENT_CATEGORY_ORDER
+    CURRENT_CATEGORY_ORDER = normalize_categories(categories if categories is not None else CURRENT_CATEGORY_ORDER)
+    ordered = CURRENT_CATEGORY_ORDER[:] or DEFAULT_CATEGORIES[:]
+    CAT_COLORS = {}
+
+    n = len(ordered)
+    if n == 1:
+        CAT_COLORS[ordered[0]] = blend(MINT, PURPLE, 0.5)
+        return CAT_COLORS
+
+    for idx, cat in enumerate(ordered):
+        # 取每一段的中心，而不是直接取 0 和 1 两端
+        t = (idx + 0.5) / n
+        CAT_COLORS[cat] = blend(MINT, PURPLE, t)
+
+    return CAT_COLORS
+
+
+def set_theme_colors(mint: QColor, purple: QColor, categories=None):
+    global MINT, PURPLE
+    MINT = QColor(mint)
+    PURPLE = QColor(purple)
+    rebuild_category_colors(categories)
+
+
 def start_of_day(dt: datetime) -> datetime:
     return dt.replace(hour=0, minute=0, second=0, microsecond=0)
 
@@ -330,7 +411,10 @@ def add_months(dt: datetime, delta: int) -> datetime:
 
 
 def normalize_category(cat: str) -> str:
-    return CATEGORY_ALIASES.get(str(cat).strip(), "Other")
+    s = str(cat or "").strip()
+    if not s:
+        return "Other"
+    return CATEGORY_ALIASES.get(s, s)
 
 
 def normalize_categories(items) -> list[str]:
@@ -550,20 +634,20 @@ class TrackerDB:
             pass
 
 
-CAT_COLORS = {
-    "Work": blend(MINT, PURPLE, 0.00),
-    "Study": blend(MINT, PURPLE, 0.14),
-    "Meal": blend(MINT, PURPLE, 0.28),
-    "Fun": blend(MINT, PURPLE, 0.42),
-    "Commute": blend(MINT, PURPLE, 0.58),
-    "Exercise": blend(MINT, PURPLE, 0.72),
-    "Rest": blend(MINT, PURPLE, 0.86),
-    "Other": blend(MINT, PURPLE, 1.00),
-}
+CAT_COLORS: dict[str, QColor] = {}
+rebuild_category_colors()
 
 
 def color_for_category(cat: str) -> QColor:
-    return CAT_COLORS.get(normalize_category(cat), blend(MINT, PURPLE, 0.5))
+    normalized = normalize_category(cat)
+    if normalized in CAT_COLORS:
+        return CAT_COLORS[normalized]
+    fingerprint = sum((idx + 1) * ord(ch) for idx, ch in enumerate(normalized))
+    ratio = (fingerprint % 1000) / 999.0 if normalized else 0.5
+
+    # 避免未知类别贴边到 A 或 B
+    ratio = 0.1 + ratio * 0.8
+    return blend(MINT, PURPLE, ratio)
 
 
 
@@ -599,40 +683,40 @@ class LightWallpaperBackground(QWidget):
 
         # very thick outer glass edge
         g_outer = QLinearGradient(r.topLeft(), r.bottomRight())
-        g_outer.setColorAt(0.00, QColor(255, 255, 255, 220))
-        g_outer.setColorAt(0.14, QColor(255, 255, 255, 138))
-        g_outer.setColorAt(0.55, QColor(255, 255, 255, 82))
-        g_outer.setColorAt(1.00, QColor(255, 255, 255, 190))
+        g_outer.setColorAt(0.00, QColor(255, 255, 255, ga(self, 220)))
+        g_outer.setColorAt(0.14, QColor(255, 255, 255, ga(self, 138)))
+        g_outer.setColorAt(0.55, QColor(255, 255, 255, ga(self, 82)))
+        g_outer.setColorAt(1.00, QColor(255, 255, 255, ga(self, 190)))
         p.fillPath(band_outer, g_outer)
 
         g_mid = QLinearGradient(r.topLeft(), r.bottomRight())
-        g_mid.setColorAt(0.00, QColor(255, 255, 255, 120))
-        g_mid.setColorAt(0.36, QColor(210, 238, 236, 66))
-        g_mid.setColorAt(0.74, QColor(205, 210, 246, 52))
-        g_mid.setColorAt(1.00, QColor(255, 255, 255, 96))
+        g_mid.setColorAt(0.00, QColor(255, 255, 255, ga(self, 120)))
+        g_mid.setColorAt(0.36, QColor(210, 238, 236, ga(self, 66)))
+        g_mid.setColorAt(0.74, QColor(205, 210, 246, ga(self, 52)))
+        g_mid.setColorAt(1.00, QColor(255, 255, 255, ga(self, 96)))
         p.fillPath(band_mid, g_mid)
 
         g_inner = QLinearGradient(r.topLeft(), r.bottomRight())
-        g_inner.setColorAt(0.00, QColor(255, 255, 255, 58))
-        g_inner.setColorAt(0.50, QColor(255, 255, 255, 22))
-        g_inner.setColorAt(1.00, QColor(255, 255, 255, 42))
+        g_inner.setColorAt(0.00, QColor(255, 255, 255, ga(self, 58)))
+        g_inner.setColorAt(0.50, QColor(255, 255, 255, ga(self, 22)))
+        g_inner.setColorAt(1.00, QColor(255, 255, 255, ga(self, 42)))
         p.fillPath(band_inner, g_inner)
 
         fill = QLinearGradient(panel_r.topLeft(), panel_r.bottomRight())
-        fill.setColorAt(0.0, QColor(248, 251, 252, 148))
-        fill.setColorAt(0.45, QColor(245, 249, 251, 132))
-        fill.setColorAt(1.0, QColor(249, 247, 252, 142))
+        fill.setColorAt(0.0, QColor(248, 251, 252, ga(self, 148)))
+        fill.setColorAt(0.45, QColor(245, 249, 251, ga(self, 132)))
+        fill.setColorAt(1.0, QColor(249, 247, 252, ga(self, 142)))
         p.fillPath(panel, fill)
 
         p.save()
         p.setClipPath(outer)
 
         blobs = [
-            (QPointF(r.left() + r.width() * 0.08, r.top() + r.height() * 0.18), min(r.width(), r.height()) * 0.26, QColor(MINT.red(), MINT.green(), MINT.blue(), 36)),
-            (QPointF(r.right() - r.width() * 0.10, r.top() + r.height() * 0.22), min(r.width(), r.height()) * 0.24, QColor(PURPLE.red(), PURPLE.green(), PURPLE.blue(), 34)),
-            (QPointF(r.left() + r.width() * 0.16, r.bottom() - r.height() * 0.10), min(r.width(), r.height()) * 0.28, QColor(MINT.red(), MINT.green(), MINT.blue(), 28)),
-            (QPointF(r.right() - r.width() * 0.12, r.bottom() - r.height() * 0.12), min(r.width(), r.height()) * 0.26, QColor(PURPLE.red(), PURPLE.green(), PURPLE.blue(), 26)),
-            (QPointF(r.left() + r.width() * 0.52, r.bottom() - r.height() * 0.04), min(r.width(), r.height()) * 0.22, QColor(255, 255, 255, 34)),
+            (QPointF(r.left() + r.width() * 0.08, r.top() + r.height() * 0.18), min(r.width(), r.height()) * 0.26, color_with_alpha(MINT, 36, self)),
+            (QPointF(r.right() - r.width() * 0.10, r.top() + r.height() * 0.22), min(r.width(), r.height()) * 0.24, color_with_alpha(PURPLE, 34, self)),
+            (QPointF(r.left() + r.width() * 0.16, r.bottom() - r.height() * 0.10), min(r.width(), r.height()) * 0.28, color_with_alpha(MINT, 28, self)),
+            (QPointF(r.right() - r.width() * 0.12, r.bottom() - r.height() * 0.12), min(r.width(), r.height()) * 0.26, color_with_alpha(PURPLE, 26, self)),
+            (QPointF(r.left() + r.width() * 0.52, r.bottom() - r.height() * 0.04), min(r.width(), r.height()) * 0.22, QColor(255, 255, 255, ga(self, 34))),
         ]
         p.setCompositionMode(QPainter.CompositionMode_Screen)
         for center, rad, col in blobs:
@@ -646,22 +730,22 @@ class LightWallpaperBackground(QWidget):
         p.setCompositionMode(QPainter.CompositionMode_SourceOver)
 
         top_gloss = QLinearGradient(r.left(), r.top(), r.left(), r.top() + r.height() * 0.34)
-        top_gloss.setColorAt(0.00, QColor(255, 255, 255, 108))
-        top_gloss.setColorAt(0.30, QColor(255, 255, 255, 28))
+        top_gloss.setColorAt(0.00, QColor(255, 255, 255, ga(self, 108)))
+        top_gloss.setColorAt(0.30, QColor(255, 255, 255, ga(self, 28)))
         top_gloss.setColorAt(1.00, QColor(255, 255, 255, 0))
         p.fillRect(r.toRect(), top_gloss)
 
         # refractive bright rails near edges
-        p.setPen(QPen(QColor(255, 255, 255, 228), 1.6))
+        p.setPen(QPen(QColor(255, 255, 255, ga(self, 228)), 1.6))
         p.drawRoundedRect(r.adjusted(1, 1, -1, -1), 36, 36)
-        p.setPen(QPen(QColor(255, 255, 255, 116), 1.1))
+        p.setPen(QPen(QColor(255, 255, 255, ga(self, 116)), 1.1))
         p.drawRoundedRect(r.adjusted(6, 6, -6, -6), 32, 32)
-        p.setPen(QPen(QColor(MINT.red(), MINT.green(), MINT.blue(), 46), 1.0))
+        p.setPen(QPen(color_with_alpha(MINT, 46, self), 1.0))
         p.drawLine(int(r.left() + 18), int(r.bottom() - 28), int(r.left() + r.width() * 0.36), int(r.bottom() - 28))
-        p.setPen(QPen(QColor(PURPLE.red(), PURPLE.green(), PURPLE.blue(), 42), 1.0))
+        p.setPen(QPen(color_with_alpha(PURPLE, 42, self), 1.0))
         p.drawLine(int(r.right() - r.width() * 0.28), int(r.top() + 24), int(r.right() - 24), int(r.top() + 24))
 
-        p.setOpacity(0.014)
+        p.setOpacity(0.014 * glass_scale_for(self))
         noise = get_noise_pixmap()
         for yy in range(int(r.top()), int(r.bottom()), noise.height()):
             for xx in range(int(r.left()), int(r.right()), noise.width()):
@@ -685,7 +769,7 @@ class LightGlassCard(QWidget):
 
         shadow_path = QPainterPath()
         shadow_path.addRoundedRect(QRectF(r.adjusted(0, 11, 0, 14)), self.radius, self.radius)
-        p.fillPath(shadow_path, QColor(0, 0, 0, 18))
+        p.fillPath(shadow_path, QColor(0, 0, 0, ga(self, 18)))
 
         outer = QPainterPath()
         outer.addRoundedRect(r, self.radius, self.radius)
@@ -704,27 +788,27 @@ class LightGlassCard(QWidget):
         band_inner = rim_mid.subtracted(panel)
 
         g_outer = QLinearGradient(r.topLeft(), r.bottomRight())
-        g_outer.setColorAt(0.00, QColor(255, 255, 255, 205))
+        g_outer.setColorAt(0.00, QColor(255, 255, 255, ga(self, 205)))
         g_outer.setColorAt(0.18, QColor(255, 255, 255, 118))
-        g_outer.setColorAt(0.52, QColor(255, 255, 255, 72))
-        g_outer.setColorAt(1.00, QColor(255, 255, 255, 170))
+        g_outer.setColorAt(0.52, QColor(255, 255, 255, ga(self, 72)))
+        g_outer.setColorAt(1.00, QColor(255, 255, 255, ga(self, 170)))
         p.fillPath(band_outer, g_outer)
 
         g_mid = QLinearGradient(r.topLeft(), r.bottomRight())
-        g_mid.setColorAt(0.00, QColor(255, 255, 255, 92))
-        g_mid.setColorAt(0.55, QColor(255, 255, 255, 34))
-        g_mid.setColorAt(1.00, QColor(255, 255, 255, 70))
+        g_mid.setColorAt(0.00, QColor(255, 255, 255, ga(self, 92)))
+        g_mid.setColorAt(0.55, QColor(255, 255, 255, ga(self, 34)))
+        g_mid.setColorAt(1.00, QColor(255, 255, 255, ga(self, 70)))
         p.fillPath(band_mid, g_mid)
 
         g_inner = QLinearGradient(r.topLeft(), r.bottomRight())
-        g_inner.setColorAt(0.00, QColor(255, 255, 255, 50))
-        g_inner.setColorAt(1.00, QColor(255, 255, 255, 18))
+        g_inner.setColorAt(0.00, QColor(255, 255, 255, ga(self, 50)))
+        g_inner.setColorAt(1.00, QColor(255, 255, 255, ga(self, 18)))
         p.fillPath(band_inner, g_inner)
 
         fill = QLinearGradient(panel_r.topLeft(), panel_r.bottomRight())
-        fill.setColorAt(0.00, QColor(255, 255, 255, 132))
-        fill.setColorAt(0.35, QColor(255, 255, 255, 96))
-        fill.setColorAt(1.00, QColor(255, 255, 255, 82))
+        fill.setColorAt(0.00, QColor(255, 255, 255, ga(self, 132)))
+        fill.setColorAt(0.35, QColor(255, 255, 255, ga(self, 96)))
+        fill.setColorAt(1.00, QColor(255, 255, 255, ga(self, 82)))
         p.fillPath(panel, fill)
 
         clip = QPainterPath()
@@ -733,22 +817,22 @@ class LightGlassCard(QWidget):
         p.setClipPath(clip)
 
         top_glow = QLinearGradient(r.left(), r.top(), r.left(), r.top() + r.height() * 0.46)
-        top_glow.setColorAt(0.0, QColor(255, 255, 255, 176))
-        top_glow.setColorAt(0.28, QColor(255, 255, 255, 58))
+        top_glow.setColorAt(0.0, QColor(255, 255, 255, ga(self, 176)))
+        top_glow.setColorAt(0.28, QColor(255, 255, 255, ga(self, 58)))
         top_glow.setColorAt(1.0, QColor(255, 255, 255, 0))
         p.fillRect(r.toRect(), top_glow)
 
         lower_pool = QLinearGradient(r.left(), r.bottom(), r.right(), r.top())
-        lower_pool.setColorAt(0.0, QColor(MINT.red(), MINT.green(), MINT.blue(), 28))
+        lower_pool.setColorAt(0.0, color_with_alpha(MINT, 28, self))
         lower_pool.setColorAt(0.5, QColor(255, 255, 255, 0))
-        lower_pool.setColorAt(1.0, QColor(PURPLE.red(), PURPLE.green(), PURPLE.blue(), 24))
+        lower_pool.setColorAt(1.0, color_with_alpha(PURPLE, 24, self))
         p.fillRect(r.toRect(), lower_pool)
 
         edge_lights = [
-            (QPointF(r.left() + r.width() * 0.10, r.bottom() - r.height() * 0.10), QColor(MINT.red(), MINT.green(), MINT.blue(), 66), r.width() * 0.20),
-            (QPointF(r.right() - r.width() * 0.12, r.top() + r.height() * 0.12), QColor(PURPLE.red(), PURPLE.green(), PURPLE.blue(), 58), r.width() * 0.18),
-            (QPointF(r.right() - r.width() * 0.10, r.bottom() - r.height() * 0.10), QColor(PURPLE.red(), PURPLE.green(), PURPLE.blue(), 40), r.width() * 0.18),
-            (QPointF(r.left() + r.width() * 0.52, r.bottom() - r.height() * 0.04), QColor(255, 255, 255, 44), r.width() * 0.22),
+            (QPointF(r.left() + r.width() * 0.10, r.bottom() - r.height() * 0.10), color_with_alpha(MINT, 66, self), r.width() * 0.20),
+            (QPointF(r.right() - r.width() * 0.12, r.top() + r.height() * 0.12), color_with_alpha(PURPLE, 58, self), r.width() * 0.18),
+            (QPointF(r.right() - r.width() * 0.10, r.bottom() - r.height() * 0.10), color_with_alpha(PURPLE, 40, self), r.width() * 0.18),
+            (QPointF(r.left() + r.width() * 0.52, r.bottom() - r.height() * 0.04), QColor(255, 255, 255, ga(self, 44)), r.width() * 0.22),
         ]
         p.setCompositionMode(QPainter.CompositionMode_Screen)
         for center, col, rad in edge_lights:
@@ -763,12 +847,12 @@ class LightGlassCard(QWidget):
 
         p.setPen(QPen(QColor(255, 255, 255, 138), 1.2))
         p.drawLine(QPointF(panel_r.left() + 18, panel_r.top() + 4), QPointF(panel_r.right() - 20, panel_r.top() + 4))
-        p.setPen(QPen(QColor(255, 255, 255, 62), 1.0))
+        p.setPen(QPen(QColor(255, 255, 255, ga(self, 62)), 1.0))
         p.drawLine(QPointF(panel_r.left() + 4, panel_r.top() + 18), QPointF(panel_r.left() + 4, panel_r.bottom() - 20))
-        p.setPen(QPen(QColor(255, 255, 255, 48), 1.0))
+        p.setPen(QPen(QColor(255, 255, 255, ga(self, 48)), 1.0))
         p.drawLine(QPointF(panel_r.left() + 28, panel_r.bottom() - 6), QPointF(panel_r.right() - 28, panel_r.bottom() - 6))
 
-        p.setOpacity(0.014)
+        p.setOpacity(0.014 * glass_scale_for(self))
         noise = get_noise_pixmap()
         for yy in range(int(r.top()), int(r.bottom()), noise.height()):
             for xx in range(int(r.left()), int(r.right()), noise.width()):
@@ -776,24 +860,26 @@ class LightGlassCard(QWidget):
         p.restore()
 
         p.setBrush(Qt.NoBrush)
-        p.setPen(QPen(QColor(255, 255, 255, 238), 1.45))
+        p.setPen(QPen(QColor(255, 255, 255, ga(self, 238)), 1.45))
         p.drawRoundedRect(r, self.radius, self.radius)
-        p.setPen(QPen(QColor(255, 255, 255, 110), 1.0))
+        p.setPen(QPen(QColor(255, 255, 255, ga(self, 110)), 1.0))
         p.drawRoundedRect(r.adjusted(4, 4, -4, -4), self.radius - 3, self.radius - 3)
-        p.setPen(QPen(QColor(170, 195, 255, 26), 0.9))
+        p.setPen(QPen(QColor(170, 195, 255, ga(self, 26)), 0.9))
         p.drawRoundedRect(panel_r.adjusted(1, 1, -1, -1), max(8, self.radius - 16), max(8, self.radius - 16))
 
 
 # ---------------- shared button styles ----------------
 def glass_button_style(active: bool = False) -> str:
     if active:
-        bg0 = f"rgba({MINT.red()},{MINT.green()},{MINT.blue()},160)"
-        bg1 = f"rgba({PURPLE.red()},{PURPLE.green()},{PURPLE.blue()},145)"
-        border = "rgba(255,255,255,220)"
+        bg0 = css_rgba(MINT, 160)
+        bg1 = css_rgba(PURPLE, 145)
+        border = css_rgba(QColor(255, 255, 255), 220)
     else:
-        bg0 = "rgba(255,255,255,136)"
-        bg1 = "rgba(255,255,255,88)"
-        border = "rgba(255,255,255,200)"
+        bg0 = css_rgba(QColor(255, 255, 255), 136)
+        bg1 = css_rgba(QColor(255, 255, 255), 88)
+        border = css_rgba(QColor(255, 255, 255), 200)
+    hover_border = css_rgba(QColor(255, 255, 255), 235)
+    pressed_bg = css_rgba(QColor(255, 255, 255), 145)
     return f'''
         QPushButton{{
             background:qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 {bg0}, stop:1 {bg1});
@@ -803,30 +889,34 @@ def glass_button_style(active: bool = False) -> str:
             padding:8px 14px;
             font-weight:800;
         }}
-        QPushButton:hover{{border:1px solid rgba(255,255,255,235);}}
-        QPushButton:pressed{{background:rgba(255,255,255,145);}}
+        QPushButton:hover{{border:1px solid {hover_border};}}
+        QPushButton:pressed{{background:{pressed_bg};}}
     '''
+
+
 def glass_tiny_button_style(active: bool = False) -> str:
     if active:
-        bg0 = f"rgba({MINT.red()},{MINT.green()},{MINT.blue()},160)"
-        bg1 = f"rgba({PURPLE.red()},{PURPLE.green()},{PURPLE.blue()},145)"
-        border = "rgba(255,255,255,220)"
+        bg0 = css_rgba(MINT, 160)
+        bg1 = css_rgba(PURPLE, 145)
+        border = css_rgba(QColor(255, 255, 255), 220)
     else:
-        bg0 = "rgba(255,255,255,136)"
-        bg1 = "rgba(255,255,255,88)"
-        border = "rgba(255,255,255,200)"
+        bg0 = css_rgba(QColor(255, 255, 255), 136)
+        bg1 = css_rgba(QColor(255, 255, 255), 88)
+        border = css_rgba(QColor(255, 255, 255), 200)
+    hover_border = css_rgba(QColor(255, 255, 255), 235)
+    pressed_bg = css_rgba(QColor(255, 255, 255), 145)
     return f'''
         QPushButton{{
             background:qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 {bg0}, stop:1 {bg1});
             color:rgba(28,38,55,235);
             border:1px solid {border};
             border-radius:12px;
-            padding:0px 6px;
+            padding:0px 8px;
             font-weight:800;
             font-size:9px;
         }}
-        QPushButton:hover{{border:1px solid rgba(255,255,255,235);}}
-        QPushButton:pressed{{background:rgba(255,255,255,145);}}
+        QPushButton:hover{{border:1px solid {hover_border};}}
+        QPushButton:pressed{{background:{pressed_bg};}}
     '''
 
 # ---------------- timer widget ----------------
@@ -984,15 +1074,15 @@ class StatsWidget(LightGlassCard):
         # 标题单独占第一行，按钮放到下面一行
         title_top = sp(self, 12)
         title_h = sp(self, 24)
-        top_y = title_top + title_h + sp(self, 6)
+        top_y = title_top + title_h + sp(self, 20)
 
-        btn_h = sp(self, 20)
+        btn_h = sp(self, 22)#按钮高度
         gap = sp(self, 4)
 
         # 尽量小一点，但保证能装下文字
-        toggle_w = sp(self, 70 if self.view_mode == self.VIEW_SUMMARY else 98)
-        scope_w = sp(self, 40)
-        scope_month_w = sp(self, 50)
+        toggle_w = sp(self, 70 if self.view_mode == self.VIEW_SUMMARY else 120)
+        scope_w = sp(self, 50) #Day、Week 的宽度
+        scope_month_w = sp(self, 60) #Month 的宽度
 
         right_x = self.width() - margin_x - toggle_w
         self.btn_summary_toggle.setGeometry(right_x, top_y, toggle_w, btn_h)
@@ -1522,6 +1612,190 @@ class DialogTitleBar(QWidget):
         e.accept()
 
 
+class SettingsDialog(GlassDialog):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.win = parent
+        self.setWindowTitle("Settings")
+        self.resize(560, 520)
+
+        self.original_scale = float(parent.glass_opacity_scale)
+        self.original_mint = QColor(MINT)
+        self.original_purple = QColor(PURPLE)
+        self.current_scale = float(parent.glass_opacity_scale)
+        self.current_mint = QColor(MINT)
+        self.current_purple = QColor(PURPLE)
+        self.original_categories = normalize_categories(parent.categories)
+        self.current_categories = self.original_categories[:]
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 12, 14, 14)
+        lay.setSpacing(12)
+        lay.addWidget(DialogTitleBar(self, "Settings"))
+
+        intro = QLabel("Adjust glass opacity, replace the default purple-green gradient, and define your own task categories.")
+        intro.setWordWrap(True)
+        intro.setStyleSheet("color:rgba(36,44,62,210); font-size:12px;")
+        lay.addWidget(intro)
+
+        opacity_title = QLabel("Glass opacity")
+        opacity_title.setStyleSheet("color:rgba(33,42,60,235); font-weight:800; font-size:13px;")
+        lay.addWidget(opacity_title)
+
+        opacity_row = QHBoxLayout()
+        opacity_row.setSpacing(10)
+        self.opacity_slider = QSlider(Qt.Horizontal)
+        self.opacity_slider.setRange(70, 185)
+        self.opacity_slider.setValue(int(round(self.current_scale * 100)))
+        self.opacity_slider.valueChanged.connect(self._on_opacity_changed)
+        opacity_row.addWidget(self.opacity_slider, 1)
+        self.lbl_opacity = QLabel()
+        self.lbl_opacity.setFixedWidth(58)
+        self.lbl_opacity.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.lbl_opacity.setStyleSheet("color:rgba(33,42,60,235); font-weight:800;")
+        opacity_row.addWidget(self.lbl_opacity)
+        lay.addLayout(opacity_row)
+
+        color_title = QLabel("Gradient colors")
+        color_title.setStyleSheet("color:rgba(33,42,60,235); font-weight:800; font-size:13px;")
+        lay.addWidget(color_title)
+
+        color_row = QHBoxLayout()
+        color_row.setSpacing(10)
+        self.btn_color_1 = QPushButton("Color A")
+        self.btn_color_2 = QPushButton("Color B")
+        self.btn_color_1.clicked.connect(lambda: self._pick_color(1))
+        self.btn_color_2.clicked.connect(lambda: self._pick_color(2))
+        color_row.addWidget(self.btn_color_1)
+        color_row.addWidget(self.btn_color_2)
+        self.btn_reset = QPushButton("Reset")
+        self.btn_reset.clicked.connect(self._reset_defaults)
+        color_row.addWidget(self.btn_reset)
+        lay.addLayout(color_row)
+
+        self.preview = QLabel("Gradient preview")
+        self.preview.setAlignment(Qt.AlignCenter)
+        self.preview.setFixedHeight(84)
+        lay.addWidget(self.preview)
+
+        category_title = QLabel("Task categories")
+        category_title.setStyleSheet("color:rgba(33,42,60,235); font-weight:800; font-size:13px;")
+        lay.addWidget(category_title)
+
+        category_hint = QLabel("One category per line. Duplicates are removed automatically when you save.")
+        category_hint.setWordWrap(True)
+        category_hint.setStyleSheet("color:rgba(90,100,120,205); font-size:12px;")
+        lay.addWidget(category_hint)
+
+        self.txt_categories = QTextEdit()
+        self.txt_categories.setPlaceholderText("Work\nStudy\nCommute")
+        self.txt_categories.setFixedHeight(118)
+        self.txt_categories.setPlainText("\n".join(self.current_categories))
+        self.txt_categories.setStyleSheet(
+            "QTextEdit{"
+            "background:rgba(255,255,255,78); color:rgba(33,42,60,235);"
+            "border:1px solid rgba(255,255,255,138); border-radius:16px; padding:10px 12px; font-size:12px; }"
+        )
+        lay.addWidget(self.txt_categories)
+
+        category_row = QHBoxLayout()
+        category_row.setSpacing(10)
+        self.btn_reset_categories = QPushButton("Default task types")
+        self.btn_reset_categories.clicked.connect(self._reset_categories_defaults)
+        self.btn_reset_categories.setCursor(Qt.PointingHandCursor)
+        self.btn_reset_categories.setStyleSheet(glass_button_style())
+        category_row.addWidget(self.btn_reset_categories)
+        category_row.addStretch(1)
+        lay.addLayout(category_row)
+
+        lay.addStretch(1)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        lay.addWidget(btns)
+
+        for btn in (self.btn_color_1, self.btn_color_2, self.btn_reset):
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setStyleSheet(glass_button_style())
+        for btn in btns.buttons():
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setStyleSheet(glass_button_style())
+
+        self._update_preview(push_preview=True)
+
+    def _color_chip_style(self, color: QColor) -> str:
+        rgba = f"rgba({color.red()},{color.green()},{color.blue()},230)"
+        return (
+            "QPushButton{" 
+            f"background:{rgba}; color:rgba(20,28,40,235); border:1px solid rgba(255,255,255,210); "
+            "border-radius:14px; padding:8px 14px; font-weight:800;}"
+            "QPushButton:hover{border:1px solid rgba(255,255,255,235);}"
+        )
+
+    def _on_opacity_changed(self, value: int):
+        self.current_scale = clamp_glass_opacity_scale(value / 100.0)
+        self._update_preview(push_preview=True)
+
+    def _pick_color(self, which: int):
+        current = self.current_mint if which == 1 else self.current_purple
+        color = QColorDialog.getColor(current, self, "Choose color")
+        if not color.isValid():
+            return
+        if which == 1:
+            self.current_mint = QColor(color)
+        else:
+            self.current_purple = QColor(color)
+        self._update_preview(push_preview=True)
+
+    def _reset_defaults(self):
+        self.current_scale = DEFAULT_GLASS_OPACITY_SCALE
+        self.current_mint = QColor(DEFAULT_MINT)
+        self.current_purple = QColor(DEFAULT_PURPLE)
+        self.opacity_slider.blockSignals(True)
+        self.opacity_slider.setValue(int(round(self.current_scale * 100)))
+        self.opacity_slider.blockSignals(False)
+        self._update_preview(push_preview=True)
+
+    def _reset_categories_defaults(self):
+        self.current_categories = DEFAULT_CATEGORIES[:]
+        self.txt_categories.setPlainText("\n".join(self.current_categories))
+
+    def _parsed_categories(self) -> list[str]:
+        raw_lines = [line.strip() for line in self.txt_categories.toPlainText().splitlines()]
+        filtered = [line for line in raw_lines if line]
+        return normalize_categories(filtered)
+
+    def _update_preview(self, push_preview: bool):
+        self.lbl_opacity.setText(f"{int(round(self.current_scale * 100))}%")
+        self.btn_color_1.setStyleSheet(self._color_chip_style(self.current_mint))
+        self.btn_color_2.setStyleSheet(self._color_chip_style(self.current_purple))
+        g0 = css_rgba(self.current_mint, 210, self.current_scale)
+        g1 = css_rgba(self.current_purple, 210, self.current_scale)
+        border = css_rgba(QColor(255, 255, 255), 220, self.current_scale)
+        self.preview.setStyleSheet(
+            f"background:qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 {g0}, stop:1 {g1});"
+            f"border:1px solid {border}; border-radius:18px;"
+            "color:rgba(20,28,40,235); font-weight:900; font-size:13px;"
+        )
+        if push_preview:
+            self.win.apply_theme_settings(self.current_scale, self.current_mint, self.current_purple, persist=False)
+
+    def accept(self):
+        categories = self._parsed_categories()
+        if not categories:
+            QMessageBox.information(self, "Categories required", "Please keep at least one task category.")
+            return
+        self.current_categories = categories
+        self.win.apply_category_settings(self.current_categories, persist=True)
+        self.win.apply_theme_settings(self.current_scale, self.current_mint, self.current_purple, persist=True)
+        super().accept()
+
+    def reject(self):
+        self.win.apply_theme_settings(self.original_scale, self.original_mint, self.original_purple, persist=False)
+        super().reject()
+
+
 class TaskDialog(GlassDialog):
     def __init__(self, parent, start_dt: datetime, end_dt: datetime, categories, preset_cat=None, preset_task=None, title="Log Task"):
         super().__init__(parent)
@@ -1542,7 +1816,12 @@ class TaskDialog(GlassDialog):
         lay.addWidget(meta)
 
         self.cmb = QComboBox()
-        self.cmb.addItems(normalize_categories(categories))
+        category_items = normalize_categories(categories)
+        if preset_cat:
+            preset_normalized = normalize_category(preset_cat)
+            if preset_normalized not in category_items:
+                category_items.append(preset_normalized)
+        self.cmb.addItems(category_items)
         if preset_cat:
             self.cmb.setCurrentText(normalize_category(preset_cat))
         lay.addWidget(self.cmb)
@@ -1631,7 +1910,12 @@ class PlanDialog(GlassDialog):
         lay.addLayout(meta)
 
         self.cmb = QComboBox()
-        self.cmb.addItems(normalize_categories(categories))
+        category_items = normalize_categories(categories)
+        if preset_cat:
+            preset_normalized = normalize_category(preset_cat)
+            if preset_normalized not in category_items:
+                category_items.append(preset_normalized)
+        self.cmb.addItems(category_items)
         if preset_cat:
             self.cmb.setCurrentText(normalize_category(preset_cat))
         lay.addWidget(self.cmb)
@@ -1873,7 +2157,7 @@ class TitleBar(QWidget):
         lay.setSpacing(8)
 
         self.left_spacer = QWidget()
-        self.left_spacer.setFixedWidth(104)
+        self.left_spacer.setFixedWidth(140)
         lay.addWidget(self.left_spacer)
         lay.addStretch(1)
 
@@ -1887,21 +2171,24 @@ class TitleBar(QWidget):
         right_lay.setContentsMargins(0, 0, 0, 0)
         right_lay.setSpacing(8)
 
+        self.btn_settings = QPushButton("⚙")
+        self.btn_settings.setCursor(Qt.PointingHandCursor)
+        self.btn_settings.clicked.connect(self.win.open_settings_dialog)
+        right_lay.addWidget(self.btn_settings)
+
         self.btn_pin = QPushButton()
         self.btn_pin.setCursor(Qt.PointingHandCursor)
-        self.btn_pin.setStyleSheet(glass_tiny_button_style())
         self.btn_pin.clicked.connect(self.win.toggle_window_locked)
         right_lay.addWidget(self.btn_pin)
 
         self.btn_close = QPushButton("✕")
         self.btn_close.setCursor(Qt.PointingHandCursor)
-        self.btn_close.setStyleSheet(glass_tiny_button_style())
         self.btn_close.clicked.connect(self.win.close)
         right_lay.addWidget(self.btn_close)
         lay.addWidget(self.right_box)
 
         self.apply_scale()
-        self.refresh_lock_button()
+        self.refresh_theme()
 
     def _sync_center(self):
         self.left_spacer.setFixedWidth(max(10, self.right_box.sizeHint().width()))
@@ -1909,10 +2196,17 @@ class TitleBar(QWidget):
     def apply_scale(self):
         self.setFixedHeight(sp(self, 38))
         self.lbl.setFont(ui_font(self, 17, QFont.Black))
+        self.btn_settings.setFixedSize(sp(self, 28), sp(self, 26))
         self.btn_pin.setFixedSize(sp(self, 60), sp(self, 26))
         self.btn_close.setFixedSize(sp(self, 28), sp(self, 26))
+        self.btn_settings.setFont(ui_font(self, 9.6, QFont.Bold))
         self.btn_pin.setFont(ui_font(self, 8.8, QFont.Bold))
         self.btn_close.setFont(ui_font(self, 8.0, QFont.Bold))
+
+    def refresh_theme(self):
+        self.btn_settings.setStyleSheet(glass_tiny_button_style())
+        self.btn_close.setStyleSheet(glass_tiny_button_style())
+        self.refresh_lock_button()
 
     def refresh_lock_button(self):
         locked = self.win.is_window_locked() if hasattr(self.win, "is_window_locked") else False
@@ -1930,7 +2224,11 @@ class TitleBar(QWidget):
     def mousePressEvent(self, e):
         if getattr(self.win, "window_locked", False):
             return
-        blocked = self.btn_close.geometry().contains(e.position().toPoint()) or self.btn_pin.geometry().contains(e.position().toPoint())
+        blocked = (
+            self.btn_close.geometry().contains(e.position().toPoint())
+            or self.btn_pin.geometry().contains(e.position().toPoint())
+            or self.btn_settings.geometry().contains(e.position().toPoint())
+        )
         if e.button() == Qt.LeftButton and not blocked:
             self._dragging = True
             self._offset = e.globalPosition().toPoint() - self.win.frameGeometry().topLeft()
@@ -2440,7 +2738,7 @@ class CalendarCanvas(LightGlassCard):
                 pr = QRectF(rect.left() + 8, line_y, rect.width() - 16, 16)
                 if self._is_focused_item(s):
                     p.setPen(QPen(QColor(255, 255, 255, 235), 1.6))
-                    p.setBrush(QColor(255, 255, 255, 28))
+                    p.setBrush(QColor(255, 255, 255, ga(self, 28)))
                     p.drawRoundedRect(pr.adjusted(-1, -1, 1, 1), 8, 8)
                 self._pill(p, pr, label, color_for_category(s["category"]))
                 hit = dict(s)
@@ -2469,7 +2767,7 @@ class CalendarCanvas(LightGlassCard):
             self._week_day_rects.append((rect, dt))
             if start_of_day(self.selected_date) == dt:
                 p.setPen(QPen(QColor(255, 255, 255, 230), 2.0))
-                p.setBrush(QColor(255, 255, 255, 34))
+                p.setBrush(QColor(255, 255, 255, ga(self, 34)))
                 p.drawRoundedRect(rect.adjusted(4, 4, -4, -4), 14, 14)
             p.setPen(WEEKEND if i >= 5 else QColor(TEXT.red(), TEXT.green(), TEXT.blue(), 220))
             p.setFont(ui_font(self, 10, QFont.Bold))
@@ -2675,9 +2973,11 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.db = TrackerDB(db_path())
         self.categories = self._load_categories()
+        rebuild_category_colors(self.categories)
         self.selected_date = start_of_day(now_local())
         self.running: RunningSession | None = None
         self.window_locked = self.db.get_state("window_locked", "0") == "1"
+        self.glass_opacity_scale = DEFAULT_GLASS_OPACITY_SCALE
         self._win_style_applied = False
         self._quitting = False
         self._start_hidden_to_tray = "--tray" in sys.argv
@@ -2689,6 +2989,7 @@ class MainWindow(QMainWindow):
         icon_path = app_icon_path()
         if icon_path:
             self.setWindowIcon(QIcon(icon_path))
+        self._load_theme_settings()
         self._set_initial_centered_geometry()
         self._build_ui()
         self._setup_tray()
@@ -2818,6 +3119,58 @@ class MainWindow(QMainWindow):
         self.db.set_state("categories", json.dumps(DEFAULT_CATEGORIES, ensure_ascii=False))
         return DEFAULT_CATEGORIES[:]
 
+    def _load_theme_settings(self):
+        global CURRENT_GLASS_OPACITY_SCALE
+        scale_raw = self.db.get_state("glass_opacity_scale", f"{DEFAULT_GLASS_OPACITY_SCALE:.2f}")
+        try:
+            self.glass_opacity_scale = clamp_glass_opacity_scale(float(scale_raw))
+        except Exception:
+            self.glass_opacity_scale = DEFAULT_GLASS_OPACITY_SCALE
+        CURRENT_GLASS_OPACITY_SCALE = self.glass_opacity_scale
+
+        mint = parse_color(self.db.get_state("theme_color_a", color_to_hex(DEFAULT_MINT)), DEFAULT_MINT)
+        purple = parse_color(self.db.get_state("theme_color_b", color_to_hex(DEFAULT_PURPLE)), DEFAULT_PURPLE)
+        set_theme_colors(mint, purple, self.categories)
+
+    def apply_theme_settings(self, glass_scale: float, mint: QColor, purple: QColor, persist: bool = True):
+        global CURRENT_GLASS_OPACITY_SCALE
+        self.glass_opacity_scale = clamp_glass_opacity_scale(glass_scale)
+        CURRENT_GLASS_OPACITY_SCALE = self.glass_opacity_scale
+        set_theme_colors(mint, purple, self.categories)
+        if persist:
+            self.db.set_state("glass_opacity_scale", f"{self.glass_opacity_scale:.3f}")
+            self.db.set_state("theme_color_a", color_to_hex(MINT))
+            self.db.set_state("theme_color_b", color_to_hex(PURPLE))
+        self._refresh_theme_widgets()
+
+    def apply_category_settings(self, categories, persist: bool = True):
+        self.categories = normalize_categories(categories)
+        rebuild_category_colors(self.categories)
+        if persist:
+            self.db.set_state("categories", json.dumps(self.categories, ensure_ascii=False))
+        self.refresh_all()
+        self._refresh_theme_widgets()
+
+    def _refresh_theme_widgets(self):
+        if hasattr(self, "title_bar"):
+            self.title_bar.refresh_theme()
+        if hasattr(self, "btn_month"):
+            self._update_mode_buttons(self.calendar.mode)
+        if hasattr(self, "timer") and getattr(self.timer, "btn", None) is not None:
+            self.timer.btn.setStyleSheet(glass_button_style(active=self.timer.running))
+        self.update()
+        if hasattr(self, "calendar"):
+            self.calendar.update()
+        if hasattr(self, "stats"):
+            self.stats.update()
+        if hasattr(self, "task_card"):
+            self.task_card.update()
+
+    def open_settings_dialog(self):
+        dlg = SettingsDialog(self)
+        dlg.move(self.geometry().center() - dlg.rect().center())
+        dlg.exec()
+
     def ui_scale(self) -> float:
         w = max(900.0, float(self.width() or BASE_WIDTH))
         h = max(600.0, float(self.height() or BASE_HEIGHT))
@@ -2910,6 +3263,7 @@ class MainWindow(QMainWindow):
 
         for widget, fallback in (
             (getattr(self.title_bar, "lbl", None), 17),
+            (getattr(self.title_bar, "btn_settings", None), 9.6),
             (getattr(self.title_bar, "btn_pin", None), 8.8),
             (getattr(self.title_bar, "btn_close", None), 8.0),
         ):
