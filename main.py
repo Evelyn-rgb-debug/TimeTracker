@@ -40,7 +40,9 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QAbstractItemView,
+    QInputDialog,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -433,6 +435,15 @@ def normalize_task_text(text_value: str) -> str:
     return DEFAULT_TASK_PLACEHOLDER if s in {"", "(未填写)", DEFAULT_TASK_PLACEHOLDER} else s
 
 
+def day_key_from(value: datetime | str) -> str:
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d")
+    s = str(value or "").strip()
+    if len(s) >= 10:
+        return s[:10]
+    return start_of_day(now_local()).strftime("%Y-%m-%d")
+
+
 def aggregate_category_totals(items) -> tuple[list[tuple[str, int]], int, dict[str, int]]:
     totals: dict[str, int] = {}
     total = 0
@@ -505,6 +516,19 @@ class TrackerDB:
             );
             """
         )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS daily_todos(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_date TEXT NOT NULL,
+                task_text TEXT NOT NULL,
+                is_done INTEGER NOT NULL DEFAULT 0,
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                created_ts TEXT NOT NULL
+            );
+            """
+        )
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_daily_todos_task_date ON daily_todos(task_date, sort_order, id);")
         self.conn.commit()
 
     def set_state(self, k: str, v: str):
@@ -626,6 +650,66 @@ class TrackerDB:
             }
             for r in rows
         ]
+
+    def add_daily_todo(self, task_date: datetime | str, task_text: str):
+        day_key = day_key_from(task_date)
+        clean_text = str(task_text or "").strip()
+        if not clean_text:
+            return None
+        cur = self.conn.execute(
+            "SELECT COALESCE(MAX(sort_order), 0) + 1 FROM daily_todos WHERE task_date=?;",
+            (day_key,),
+        )
+        next_order = int((cur.fetchone() or [1])[0] or 1)
+        cur = self.conn.execute(
+            "INSERT INTO daily_todos(task_date,task_text,is_done,sort_order,created_ts) VALUES(?,?,?,?,?);",
+            (day_key, clean_text, 0, next_order, dt_to_str(now_local())),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def get_daily_todos(self, task_date: datetime | str):
+        day_key = day_key_from(task_date)
+        cur = self.conn.execute(
+            "SELECT id,task_date,task_text,is_done,sort_order,created_ts FROM daily_todos WHERE task_date=? ORDER BY sort_order ASC, id ASC;",
+            (day_key,),
+        )
+        rows = cur.fetchall()
+        return [
+            {
+                "id": int(r[0]),
+                "task_date": r[1],
+                "task_text": r[2],
+                "is_done": bool(r[3]),
+                "sort_order": int(r[4]),
+                "created_ts": r[5],
+            }
+            for r in rows
+        ]
+
+    def toggle_daily_todo_done(self, todo_id: int, is_done: bool | None = None):
+        if is_done is None:
+            cur = self.conn.execute("SELECT is_done FROM daily_todos WHERE id=?;", (int(todo_id),))
+            row = cur.fetchone()
+            if not row:
+                return
+            is_done = not bool(row[0])
+        self.conn.execute(
+            "UPDATE daily_todos SET is_done=? WHERE id=?;",
+            (1 if bool(is_done) else 0, int(todo_id)),
+        )
+        self.conn.commit()
+
+    def update_daily_todo(self, todo_id: int, task_text: str):
+        self.conn.execute(
+            "UPDATE daily_todos SET task_text=? WHERE id=?;",
+            (normalize_task_text(task_text), int(todo_id)),
+        )
+        self.conn.commit()
+
+    def delete_daily_todo(self, todo_id: int):
+        self.conn.execute("DELETE FROM daily_todos WHERE id=?;", (int(todo_id),))
+        self.conn.commit()
 
     def close(self):
         try:
@@ -1881,7 +1965,7 @@ class PlanDialog(GlassDialog):
     def __init__(self, parent, start_dt: datetime, end_dt: datetime, categories, preset_cat=None, preset_task=None, title="Plan Task"):
         super().__init__(parent)
         self.setWindowTitle(title)
-        self.resize(560, 410)
+        self.resize(700, 410)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(14, 12, 14, 14)
@@ -1899,14 +1983,25 @@ class PlanDialog(GlassDialog):
         self.start_time_combo = self._make_time_combo(start_dt)
         self.end_time_combo = self._make_time_combo(end_dt)
 
+        for w in (self.start_date_edit, self.end_date_edit):
+            w.setMinimumWidth(150)
+        for w in (self.start_time_combo, self.end_time_combo):
+            w.setMinimumWidth(96)
+
+        lbl_start = QLabel("Start")
+        lbl_end = QLabel("End")
+        lbl_start.setFixedWidth(40)
+        lbl_end.setFixedWidth(32)
+
         meta = QHBoxLayout()
         meta.setSpacing(10)
-        meta.addWidget(QLabel("Start"))
-        meta.addWidget(self.start_date_edit, 1)
-        meta.addWidget(self.start_time_combo, 1)
-        meta.addWidget(QLabel("End"))
-        meta.addWidget(self.end_date_edit, 1)
-        meta.addWidget(self.end_time_combo, 1)
+        meta.addWidget(lbl_start, 0)
+        meta.addWidget(self.start_date_edit, 3)
+        meta.addWidget(self.start_time_combo, 2)
+        meta.addSpacing(10)
+        meta.addWidget(lbl_end, 0)
+        meta.addWidget(self.end_date_edit, 3)
+        meta.addWidget(self.end_time_combo, 2)
         lay.addLayout(meta)
 
         self.cmb = QComboBox()
@@ -2967,6 +3062,113 @@ class TaskTableCard(LightGlassCard):
         lay.addWidget(self.table, 1)
 
 
+# ---------------- today task card ----------------
+class TodayTaskCard(LightGlassCard):
+    def __init__(self, parent=None):
+        super().__init__(radius=28, parent=parent)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 16, 16, 16)
+        lay.setSpacing(8)
+
+        self.title = QLabel("Today's Tasks")
+        self.title.setStyleSheet("color:rgba(33,42,60,235); font-weight:800;")
+        lay.addWidget(self.title)
+
+        input_row = QHBoxLayout()
+        input_row.setSpacing(8)
+        self.input = QLineEdit()
+        self.input.setPlaceholderText("Type a task for today…")
+        self.input.setClearButtonEnabled(True)
+        self.input.setStyleSheet(
+            """
+            QLineEdit{
+                background:rgba(255,255,255,74);
+                color:rgba(33,42,60,235);
+                border:1px solid rgba(255,255,255,165);
+                border-radius:14px;
+                padding:8px 12px;
+            }
+            """
+        )
+        input_row.addWidget(self.input, 1)
+
+        self.btn_add = QPushButton("Add")
+        self.btn_add.setCursor(Qt.PointingHandCursor)
+        self.btn_add.setStyleSheet(glass_button_style())
+        input_row.addWidget(self.btn_add)
+
+        lay.addLayout(input_row)
+
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["ID", "", "Task"])
+        self.table.setColumnHidden(0, True)
+        self.table.horizontalHeader().hide()
+        self.table.verticalHeader().setVisible(False)
+        self.table.setShowGrid(False)
+        self.table.setWordWrap(True)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.setStyleSheet(
+            """
+            QTableWidget{
+                background:rgba(255,255,255,74);
+                color:rgba(33,42,60,235);
+                border:1px solid rgba(255,255,255,165);
+                border-radius:14px;
+                selection-background-color:rgba(176,182,192,88);
+                selection-color:rgba(33,42,60,235);
+            }
+            QTableWidget::item{
+                border:none;
+                padding:6px 4px;
+            }
+            QTableWidget::item:selected{
+                background:rgba(176,182,192,88);
+                color:rgba(33,42,60,235);
+            }
+            """
+        )
+        lay.addWidget(self.table, 1)
+
+    def set_tasks(self, day_dt: datetime, tasks):
+        self.title.setText(f"Today's Tasks  ·  {day_key_from(day_dt)}")
+        self.table.setRowCount(0)
+        for task in tasks or []:
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            self.table.setRowHeight(row, 34)
+
+            id_item = QTableWidgetItem(str(task["id"]))
+            mark_item = QTableWidgetItem("●" if task.get("is_done") else "○")
+            text_item = QTableWidgetItem(str(task.get("task_text", "")).strip())
+
+            mark_item.setTextAlignment(Qt.AlignCenter)
+            for item in (id_item, mark_item, text_item):
+                item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+
+            mark_font = mark_item.font()
+            mark_font.setBold(True)
+            mark_item.setFont(mark_font)
+
+            text_font = text_item.font()
+            if task.get("is_done"):
+                text_font.setStrikeOut(True)
+                text_item.setFont(text_font)
+                mark_item.setForeground(QColor(150, 156, 166))
+                text_item.setForeground(QColor(150, 156, 166))
+            else:
+                mark_item.setForeground(QColor(PURPLE.red(), PURPLE.green(), PURPLE.blue(), 220))
+                text_item.setForeground(QColor(TEXT.red(), TEXT.green(), TEXT.blue(), 235))
+
+            self.table.setItem(row, 0, id_item)
+            self.table.setItem(row, 1, mark_item)
+            self.table.setItem(row, 2, text_item)
+
+
 # ---------------- main window ----------------
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -2982,6 +3184,7 @@ class MainWindow(QMainWindow):
         self._quitting = False
         self._start_hidden_to_tray = "--tray" in sys.argv
         self.range_stats_scope_mode = StatsWidget.SCOPE_MONTH
+        self.today_task_date = start_of_day(now_local())
 
         self.setWindowTitle(APP_NAME)
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window | Qt.WindowStaysOnBottomHint)
@@ -3165,6 +3368,9 @@ class MainWindow(QMainWindow):
             self.stats.update()
         if hasattr(self, "task_card"):
             self.task_card.update()
+        if hasattr(self, "today_task_card"):
+            self.today_task_card.btn_add.setStyleSheet(glass_button_style())
+            self.today_task_card.update()
 
     def open_settings_dialog(self):
         dlg = SettingsDialog(self)
@@ -3249,6 +3455,12 @@ class MainWindow(QMainWindow):
         apply_scaled_font(self.timer.btn, 11)
         apply_scaled_font(self.task_card.title, 12)
         apply_scaled_font(self.task_card.table, 10)
+        if hasattr(self, "today_task_card"):
+            apply_scaled_font(self.today_task_card.title, 12)
+            apply_scaled_font(self.today_task_card.input, 10.5)
+            apply_scaled_font(self.today_task_card.btn_add, 10.5)
+            apply_scaled_font(self.today_task_card.table, 10)
+            self.today_task_card.table.verticalHeader().setDefaultSectionSize(sp(self, 34))
         apply_scaled_font(self.task_card.table.horizontalHeader(), 10)
         apply_scaled_font(self.task_card.table.verticalHeader(), 10)
         self.task_card.table.verticalHeader().setDefaultSectionSize(sp(self, 28))
@@ -3361,8 +3573,17 @@ class MainWindow(QMainWindow):
         self.stats.on_summary_scope_changed = self._on_range_stats_scope_changed
         stats_col.addWidget(self.stats, 1)
 
+        self.today_task_card = TodayTaskCard()
+        right_col.addWidget(self.today_task_card, 2)
+
         self.task_card = TaskTableCard()
         right_col.addWidget(self.task_card, 2)
+
+        self.today_task_card.btn_add.clicked.connect(self.add_today_task)
+        self.today_task_card.input.returnPressed.connect(self.add_today_task)
+        self.today_task_card.table.cellClicked.connect(self._on_today_task_cell_clicked)
+        self.today_task_card.table.customContextMenuRequested.connect(self._on_today_task_menu)
+        self.today_task_card.table.installEventFilter(self)
 
         self.task_card.table.customContextMenuRequested.connect(self._on_table_menu)
         self.task_card.table.cellClicked.connect(self._on_table_cell_clicked)
@@ -3454,6 +3675,118 @@ class MainWindow(QMainWindow):
     def _on_range_stats_scope_changed(self, mode: str):
         self.range_stats_scope_mode = mode
         self._refresh_range_stats()
+
+    def _today_task_items(self):
+        self.today_task_date = start_of_day(now_local())
+        return self.db.get_daily_todos(self.today_task_date)
+
+    def add_today_task(self):
+        if not hasattr(self, "today_task_card"):
+            return
+        text_value = self.today_task_card.input.text().strip()
+        if not text_value:
+            return
+        self.db.add_daily_todo(start_of_day(now_local()), text_value)
+        self.today_task_card.input.clear()
+        self.refresh_all()
+
+    def _toggle_today_task_by_row(self, row: int):
+        if row < 0 or not hasattr(self, "today_task_card"):
+            return
+        item = self.today_task_card.table.item(row, 0)
+        if item is None:
+            return
+        self.db.toggle_daily_todo_done(int(item.text()))
+        self.refresh_all()
+
+    def _selected_today_task_ids(self) -> list[int]:
+        table = self.today_task_card.table
+        rows = sorted({idx.row() for idx in table.selectionModel().selectedRows()})
+        out = []
+        for row in rows:
+            item = table.item(row, 0)
+            if item is not None:
+                out.append(int(item.text()))
+        return out
+
+    def _today_task_row_data(self, row: int):
+        if row < 0 or not hasattr(self, "today_task_card"):
+            return None
+        table = self.today_task_card.table
+        id_item = table.item(row, 0)
+        text_item = table.item(row, 2)
+        if id_item is None or text_item is None:
+            return None
+        return {
+            "id": int(id_item.text()),
+            "task_text": text_item.text(),
+        }
+
+    def edit_selected_today_task(self):
+        if not hasattr(self, "today_task_card"):
+            return
+        row = self.today_task_card.table.currentRow()
+        if row < 0:
+            selected = self.today_task_card.table.selectionModel().selectedRows()
+            if selected:
+                row = selected[0].row()
+        self._edit_today_task_by_row(row)
+
+    def _edit_today_task_by_row(self, row: int):
+        task = self._today_task_row_data(row)
+        if not task:
+            return
+        value, ok = QInputDialog.getText(
+            self,
+            "Edit Today's Task",
+            "Task text:",
+            text=str(task.get("task_text", "")),
+        )
+        if not ok:
+            return
+        new_text = str(value or "").strip()
+        if not new_text:
+            QMessageBox.information(self, "Task text required", "Task text cannot be empty.")
+            return
+        self.db.update_daily_todo(int(task["id"]), new_text)
+        self.refresh_all()
+        table = self.today_task_card.table
+        for r in range(table.rowCount()):
+            item = table.item(r, 0)
+            if item is not None and int(item.text()) == int(task["id"]):
+                table.selectRow(r)
+                break
+
+    def _delete_today_task_ids(self, todo_ids: list[int]):
+        if not todo_ids:
+            return
+        for todo_id in todo_ids:
+            self.db.delete_daily_todo(int(todo_id))
+        self.refresh_all()
+
+    def _on_today_task_cell_clicked(self, row: int, col: int):
+        self._toggle_today_task_by_row(row)
+
+    def _on_today_task_menu(self, pos):
+        table = self.today_task_card.table
+        row = table.rowAt(pos.y())
+        if row >= 0 and row not in {idx.row() for idx in table.selectionModel().selectedRows()}:
+            table.clearSelection()
+            table.selectRow(row)
+        todo_ids = self._selected_today_task_ids()
+        if not todo_ids:
+            return
+        menu = QMenu(self)
+        act_edit = menu.addAction("Edit")
+        act_toggle = menu.addAction("Toggle Done")
+        act_delete = menu.addAction("Delete")
+        action = menu.exec(table.mapToGlobal(pos))
+        if action == act_edit:
+            self._edit_today_task_by_row(table.currentRow())
+        elif action == act_toggle:
+            self._toggle_today_task_by_row(table.currentRow())
+        elif action == act_delete:
+            self._delete_today_task_ids(todo_ids)
 
     def start_timer(self):
         if self.running:
@@ -3627,6 +3960,16 @@ class MainWindow(QMainWindow):
         if obj is self.task_card.table and event.type() == QEvent.KeyPress and event.key() == Qt.Key_Delete:
             self.request_delete_selected()
             return True
+        if hasattr(self, "today_task_card") and obj is self.today_task_card.table and event.type() == QEvent.KeyPress:
+            if event.key() in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space):
+                self._toggle_today_task_by_row(self.today_task_card.table.currentRow())
+                return True
+            if event.key() == Qt.Key_F2:
+                self.edit_selected_today_task()
+                return True
+            if event.key() == Qt.Key_Delete:
+                self._delete_today_task_ids(self._selected_today_task_ids())
+                return True
         return super().eventFilter(obj, event)
 
     def pick_calendar_month(self, current_dt: datetime):
@@ -3692,6 +4035,8 @@ class MainWindow(QMainWindow):
         self.refresh_table(items)
         self.stats.set_day_items(self.selected_date, items)
         self._refresh_range_stats()
+        if hasattr(self, "today_task_card"):
+            self.today_task_card.set_tasks(start_of_day(now_local()), self._today_task_items())
         self.calendar.update()
         self.task_card.title.setText(f"Task Details  ·  {self.selected_date.strftime('%Y-%m-%d')}")
         self._apply_dynamic_scale()
