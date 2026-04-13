@@ -40,6 +40,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QAbstractItemView,
+    QCheckBox,
     QInputDialog,
     QLabel,
     QLineEdit,
@@ -50,6 +51,7 @@ from PySide6.QtWidgets import (
     QColorDialog,
     QSlider,
     QSizeGrip,
+    QSizePolicy,
     QSystemTrayIcon,
     QTableWidget,
     QTableWidgetItem,
@@ -398,6 +400,52 @@ def clamp_item_to_range(item: dict, range_start: datetime, range_end: datetime) 
     return clipped
 
 
+def split_item_by_day(item: dict, range_start: datetime | None = None, range_end: datetime | None = None) -> list[dict]:
+    raw = dict(item)
+    clipped = dict(item)
+    if range_start is not None and range_end is not None:
+        clipped = clamp_item_to_range(clipped, range_start, range_end)
+        if clipped is None:
+            return []
+
+    try:
+        true_start = str_to_dt(raw["start"])
+        true_end = str_to_dt(raw["end"])
+        seg_start = str_to_dt(clipped["start"])
+        seg_end = str_to_dt(clipped["end"])
+    except Exception:
+        return []
+
+    if seg_end <= seg_start:
+        return []
+
+    pieces: list[dict] = []
+    cursor = seg_start
+    while cursor < seg_end:
+        next_midnight = start_of_day(cursor) + timedelta(days=1)
+        piece_end = min(seg_end, next_midnight)
+        piece = dict(clipped)
+        piece["start"] = dt_to_str(cursor)
+        piece["end"] = dt_to_str(piece_end)
+        piece["true_start"] = dt_to_str(true_start)
+        piece["true_end"] = dt_to_str(true_end)
+        piece["duration_sec"] = max(0, int((piece_end - cursor).total_seconds()))
+        if piece["duration_sec"] > 0:
+            pieces.append(piece)
+        cursor = piece_end
+
+    return pieces
+
+
+def hours_in_day_span(start_dt: datetime, end_dt: datetime) -> tuple[float, float]:
+    start_hour = start_dt.hour + start_dt.minute / 60 + start_dt.second / 3600
+    if end_dt.date() > start_dt.date():
+        end_hour = 24.0
+    else:
+        end_hour = end_dt.hour + end_dt.minute / 60 + end_dt.second / 3600
+    return start_hour, end_hour
+
+
 def week_start(dt: datetime) -> datetime:
     return start_of_day(dt) - timedelta(days=dt.weekday())
 
@@ -410,6 +458,142 @@ def add_months(dt: datetime, delta: int) -> datetime:
     y = dt.year + (dt.month - 1 + delta) // 12
     m = (dt.month - 1 + delta) % 12 + 1
     return dt.replace(year=y, month=m, day=1)
+
+
+def last_day_of_month(year: int, month: int) -> int:
+    if month == 12:
+        next_month = datetime(year + 1, 1, 1)
+    else:
+        next_month = datetime(year, month + 1, 1)
+    return (next_month - timedelta(days=1)).day
+
+
+def safe_replace_year(dt: datetime, year: int) -> datetime:
+    day = min(dt.day, last_day_of_month(year, dt.month))
+    return dt.replace(year=year, day=day)
+
+
+def safe_add_months_preserve_day(dt: datetime, delta: int) -> datetime:
+    month_index = (dt.month - 1) + int(delta)
+    year = dt.year + month_index // 12
+    month = month_index % 12 + 1
+    day = min(dt.day, last_day_of_month(year, month))
+    return dt.replace(year=year, month=month, day=day)
+
+
+def is_all_day_span(start_dt: datetime, end_dt: datetime) -> bool:
+    return (
+        start_dt.hour == 0 and start_dt.minute == 0 and start_dt.second == 0
+        and end_dt.hour == 23 and end_dt.minute == 59
+    )
+
+
+def recurrence_matches(rule: str, anchor_start: datetime, target_day: datetime) -> bool:
+    rule = str(rule or '').strip().lower()
+    if not rule or rule == 'none':
+        return start_of_day(anchor_start) == start_of_day(target_day)
+
+    anchor_day = start_of_day(anchor_start)
+    target_day = start_of_day(target_day)
+    if target_day < anchor_day:
+        return False
+
+    if rule == 'weekly':
+        return anchor_day.weekday() == target_day.weekday()
+    if rule == 'monthly':
+        desired_day = min(anchor_start.day, last_day_of_month(target_day.year, target_day.month))
+        return target_day.day == desired_day
+    if rule == 'yearly':
+        desired_day = min(anchor_start.day, last_day_of_month(target_day.year, anchor_start.month))
+        return target_day.month == anchor_start.month and target_day.day == desired_day
+    return False
+
+
+
+def previous_day_text(day_text: str) -> str:
+    try:
+        return (datetime.strptime(str(day_text), '%Y-%m-%d') - timedelta(days=1)).strftime('%Y-%m-%d')
+    except Exception:
+        return ''
+
+
+def same_day_text(a: str, b: str) -> bool:
+    try:
+        return datetime.strptime(str(a), '%Y-%m-%d').date() == datetime.strptime(str(b), '%Y-%m-%d').date()
+    except Exception:
+        return False
+
+
+def iter_plan_occurrences(plan_row: dict, range_start: datetime, range_end: datetime) -> list[dict]:
+    try:
+        base_start = str_to_dt(plan_row['start'])
+        base_end = str_to_dt(plan_row['end'])
+    except Exception:
+        return []
+
+    if base_end <= base_start:
+        return []
+
+    recurrence = str(plan_row.get('recurrence', 'none') or 'none').strip().lower()
+    is_all_day = bool(plan_row.get('is_all_day', 0))
+    duration = base_end - base_start
+
+    recur_range_start_raw = str(plan_row.get('recurrence_range_start', '') or '').strip()
+    recur_range_end_raw = str(plan_row.get('recurrence_range_end', '') or '').strip()
+    recur_range_start = start_of_day(base_start)
+    recur_range_end = start_of_day(base_start)
+    if recur_range_start_raw:
+        try:
+            recur_range_start = start_of_day(datetime.strptime(recur_range_start_raw, '%Y-%m-%d'))
+        except Exception:
+            recur_range_start = start_of_day(base_start)
+    if recur_range_end_raw:
+        try:
+            recur_range_end = start_of_day(datetime.strptime(recur_range_end_raw, '%Y-%m-%d'))
+        except Exception:
+            recur_range_end = start_of_day(base_start)
+    if recur_range_end < recur_range_start:
+        recur_range_end = recur_range_start
+
+    def make_occurrence(start_dt: datetime, end_dt: datetime) -> dict:
+        item = dict(plan_row)
+        item['start'] = dt_to_str(start_dt)
+        item['end'] = dt_to_str(end_dt)
+        item['duration_sec'] = max(0, int((end_dt - start_dt).total_seconds()))
+        item['is_all_day'] = is_all_day
+        item['recurrence'] = recurrence
+        item['series_start'] = base_start.strftime('%Y-%m-%d %H:%M:%S')
+        item['occurrence_start'] = start_dt.strftime('%Y-%m-%d %H:%M:%S')
+        item['occurrence_day'] = start_of_day(start_dt).strftime('%Y-%m-%d')
+        item['recurrence_range_start'] = recur_range_start.strftime('%Y-%m-%d')
+        item['recurrence_range_end'] = recur_range_end.strftime('%Y-%m-%d')
+        return item
+
+    if recurrence in {'', 'none'}:
+        if base_start <= range_end and base_end >= range_start:
+            return [make_occurrence(base_start, base_end)]
+        return []
+
+    occurrences = []
+    cursor_day = max(start_of_day(range_start), recur_range_start)
+    end_day = min(start_of_day(range_end), recur_range_end)
+    while cursor_day <= end_day:
+        if recurrence_matches(recurrence, base_start, cursor_day):
+            if recurrence == 'weekly':
+                occ_start = cursor_day.replace(hour=base_start.hour, minute=base_start.minute, second=base_start.second, microsecond=0)
+            elif recurrence == 'monthly':
+                occ_start = safe_add_months_preserve_day(base_start, (cursor_day.year - base_start.year) * 12 + (cursor_day.month - base_start.month))
+            else:  # yearly
+                occ_start = safe_replace_year(base_start, cursor_day.year)
+            occ_day = start_of_day(occ_start)
+            if occ_day < recur_range_start or occ_day > recur_range_end:
+                cursor_day += timedelta(days=1)
+                continue
+            occ_end = occ_start + duration
+            if occ_start <= range_end and occ_end >= range_start:
+                occurrences.append(make_occurrence(occ_start, occ_end))
+        cursor_day += timedelta(days=1)
+    return occurrences
 
 
 def normalize_category(cat: str) -> str:
@@ -528,7 +712,33 @@ class TrackerDB:
             );
             """
         )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS month_todos(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                month_key TEXT NOT NULL,
+                task_text TEXT NOT NULL,
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                created_ts TEXT NOT NULL
+            );
+            """
+        )
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_daily_todos_task_date ON daily_todos(task_date, sort_order, id);")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_month_todos_month_key ON month_todos(month_key, sort_order, id);")
+
+        cols_daily = {row[1] for row in self.conn.execute("PRAGMA table_info(daily_todos);").fetchall()}
+        if "completed_ts" not in cols_daily:
+            self.conn.execute("ALTER TABLE daily_todos ADD COLUMN completed_ts TEXT DEFAULT '';" )
+
+        cols_plans = {row[1] for row in self.conn.execute("PRAGMA table_info(plans);").fetchall()}
+        if "recurrence" not in cols_plans:
+            self.conn.execute("ALTER TABLE plans ADD COLUMN recurrence TEXT NOT NULL DEFAULT 'none';")
+        if "is_all_day" not in cols_plans:
+            self.conn.execute("ALTER TABLE plans ADD COLUMN is_all_day INTEGER NOT NULL DEFAULT 0;")
+        if "recurrence_range_start" not in cols_plans:
+            self.conn.execute("ALTER TABLE plans ADD COLUMN recurrence_range_start TEXT NOT NULL DEFAULT '';")
+        if "recurrence_range_end" not in cols_plans:
+            self.conn.execute("ALTER TABLE plans ADD COLUMN recurrence_range_end TEXT NOT NULL DEFAULT '';")
         self.conn.commit()
 
     def set_state(self, k: str, v: str):
@@ -598,18 +808,18 @@ class TrackerDB:
             for r in rows
         ]
 
-    def add_plan(self, start_dt: datetime, end_dt: datetime, category: str, task_text: str):
+    def add_plan(self, start_dt: datetime, end_dt: datetime, category: str, task_text: str, recurrence: str = "none", is_all_day: bool = False, recurrence_range_start: str = "", recurrence_range_end: str = ""):
         cur = self.conn.execute(
-            "INSERT INTO plans(start_ts,end_ts,category,task_text) VALUES(?,?,?,?);",
-            (dt_to_str(start_dt), dt_to_str(end_dt), category, task_text),
+            "INSERT INTO plans(start_ts,end_ts,category,task_text,recurrence,is_all_day,recurrence_range_start,recurrence_range_end) VALUES(?,?,?,?,?,?,?,?);",
+            (dt_to_str(start_dt), dt_to_str(end_dt), category, task_text, str(recurrence or 'none'), 1 if is_all_day else 0, str(recurrence_range_start or ''), str(recurrence_range_end or '')),
         )
         self.conn.commit()
         return int(cur.lastrowid)
 
-    def update_plan(self, pid: int, start_dt: datetime, end_dt: datetime, category: str, task_text: str):
+    def update_plan(self, pid: int, start_dt: datetime, end_dt: datetime, category: str, task_text: str, recurrence: str = "none", is_all_day: bool = False, recurrence_range_start: str = "", recurrence_range_end: str = ""):
         self.conn.execute(
-            "UPDATE plans SET start_ts=?, end_ts=?, category=?, task_text=? WHERE id=?;",
-            (dt_to_str(start_dt), dt_to_str(end_dt), category, task_text, pid),
+            "UPDATE plans SET start_ts=?, end_ts=?, category=?, task_text=?, recurrence=?, is_all_day=?, recurrence_range_start=?, recurrence_range_end=? WHERE id=?;",
+            (dt_to_str(start_dt), dt_to_str(end_dt), category, task_text, str(recurrence or 'none'), 1 if is_all_day else 0, str(recurrence_range_start or ''), str(recurrence_range_end or ''), pid),
         )
         self.conn.commit()
 
@@ -619,7 +829,7 @@ class TrackerDB:
 
     def get_plan_by_id(self, pid: int):
         cur = self.conn.execute(
-            "SELECT id,start_ts,end_ts,category,task_text FROM plans WHERE id=?;",
+            "SELECT id,start_ts,end_ts,category,task_text,COALESCE(recurrence,'none'),COALESCE(is_all_day,0),COALESCE(recurrence_range_start,''),COALESCE(recurrence_range_end,'') FROM plans WHERE id=?;",
             (pid,),
         )
         row = cur.fetchone()
@@ -631,25 +841,33 @@ class TrackerDB:
             "end": row[2],
             "category": row[3],
             "task_text": row[4],
+            "recurrence": row[5],
+            "is_all_day": bool(row[6]),
+            "recurrence_range_start": row[7],
+            "recurrence_range_end": row[8],
         }
 
     def get_plans_in_range(self, start_dt: datetime, end_dt: datetime):
         cur = self.conn.execute(
-            "SELECT id,start_ts,end_ts,category,task_text FROM plans WHERE start_ts <= ? AND end_ts >= ? ORDER BY start_ts ASC;",
-            (dt_to_str(end_dt), dt_to_str(start_dt)),
+            "SELECT id,start_ts,end_ts,category,task_text,COALESCE(recurrence,'none'),COALESCE(is_all_day,0),COALESCE(recurrence_range_start,''),COALESCE(recurrence_range_end,'') FROM plans ORDER BY start_ts ASC;",
         )
         rows = cur.fetchall()
-        return [
-            {
+        out = []
+        for r in rows:
+            row = {
                 "id": int(r[0]),
                 "start": r[1],
                 "end": r[2],
-                "duration_sec": max(0, int((str_to_dt(r[2]) - str_to_dt(r[1])).total_seconds())),
                 "category": r[3],
                 "task_text": r[4],
+                "recurrence": r[5],
+                "is_all_day": bool(r[6]),
+                "recurrence_range_start": r[7],
+                "recurrence_range_end": r[8],
             }
-            for r in rows
-        ]
+            out.extend(iter_plan_occurrences(row, start_dt, end_dt))
+        out.sort(key=lambda item: item.get("start", ""))
+        return out
 
     def add_daily_todo(self, task_date: datetime | str, task_text: str):
         day_key = day_key_from(task_date)
@@ -662,8 +880,8 @@ class TrackerDB:
         )
         next_order = int((cur.fetchone() or [1])[0] or 1)
         cur = self.conn.execute(
-            "INSERT INTO daily_todos(task_date,task_text,is_done,sort_order,created_ts) VALUES(?,?,?,?,?);",
-            (day_key, clean_text, 0, next_order, dt_to_str(now_local())),
+            "INSERT INTO daily_todos(task_date,task_text,is_done,sort_order,created_ts,completed_ts) VALUES(?,?,?,?,?,?);",
+            (day_key, clean_text, 0, next_order, dt_to_str(now_local()), ""),
         )
         self.conn.commit()
         return int(cur.lastrowid)
@@ -671,7 +889,7 @@ class TrackerDB:
     def get_daily_todos(self, task_date: datetime | str):
         day_key = day_key_from(task_date)
         cur = self.conn.execute(
-            "SELECT id,task_date,task_text,is_done,sort_order,created_ts FROM daily_todos WHERE task_date=? ORDER BY sort_order ASC, id ASC;",
+            "SELECT id,task_date,task_text,is_done,sort_order,created_ts,COALESCE(completed_ts,'') FROM daily_todos WHERE task_date=? ORDER BY sort_order ASC, id ASC;",
             (day_key,),
         )
         rows = cur.fetchall()
@@ -683,22 +901,112 @@ class TrackerDB:
                 "is_done": bool(r[3]),
                 "sort_order": int(r[4]),
                 "created_ts": r[5],
+                "completed_ts": r[6],
             }
             for r in rows
         ]
 
-    def toggle_daily_todo_done(self, todo_id: int, is_done: bool | None = None):
-        if is_done is None:
-            cur = self.conn.execute("SELECT is_done FROM daily_todos WHERE id=?;", (int(todo_id),))
-            row = cur.fetchone()
-            if not row:
-                return
-            is_done = not bool(row[0])
-        self.conn.execute(
-            "UPDATE daily_todos SET is_done=? WHERE id=?;",
-            (1 if bool(is_done) else 0, int(todo_id)),
+    def get_daily_todos_for_display(self, task_date: datetime | str):
+        day_key = day_key_from(task_date)
+        cur = self.conn.execute(
+            """
+            SELECT id,task_date,task_text,is_done,sort_order,created_ts,COALESCE(completed_ts,'')
+            FROM daily_todos
+            WHERE task_date <= ?
+            ORDER BY task_date ASC, sort_order ASC, id ASC;
+            """,
+            (day_key,),
+        )
+        rows = cur.fetchall()
+        return [
+            {
+                "id": int(r[0]),
+                "task_date": r[1],
+                "task_text": r[2],
+                "is_done": bool(r[3]),
+                "sort_order": int(r[4]),
+                "created_ts": r[5],
+                "completed_ts": r[6],
+                "is_carryover": (r[1] != day_key),
+            }
+            for r in rows
+        ]
+
+    def add_month_todo(self, anchor_date: datetime | str, task_text: str):
+        month_key = day_key_from(anchor_date)[:7]
+        clean_text = str(task_text or "").strip()
+        if not clean_text:
+            return None
+        cur = self.conn.execute(
+            "SELECT COALESCE(MAX(sort_order), 0) + 1 FROM month_todos WHERE month_key=?;",
+            (month_key,),
+        )
+        next_order = int((cur.fetchone() or [1])[0] or 1)
+        cur = self.conn.execute(
+            "INSERT INTO month_todos(month_key,task_text,sort_order,created_ts) VALUES(?,?,?,?);",
+            (month_key, clean_text, next_order, dt_to_str(now_local())),
         )
         self.conn.commit()
+        return int(cur.lastrowid)
+
+    def get_month_todos_for_display(self, anchor_date: datetime | str):
+        month_key = day_key_from(anchor_date)[:7]
+        cur = self.conn.execute(
+            """
+            SELECT id,month_key,task_text,sort_order,created_ts
+            FROM month_todos
+            WHERE month_key <= ?
+            ORDER BY month_key ASC, sort_order ASC, id ASC;
+            """,
+            (month_key,),
+        )
+        rows = cur.fetchall()
+        return [
+            {
+                "id": int(r[0]),
+                "month_key": r[1],
+                "task_text": r[2],
+                "is_done": False,
+                "sort_order": int(r[3]),
+                "created_ts": r[4],
+                "is_carryover": (r[1] != month_key),
+            }
+            for r in rows
+        ]
+
+    def delete_daily_todo(self, todo_id: int):
+        self.conn.execute("DELETE FROM daily_todos WHERE id=?;", (int(todo_id),))
+        self.conn.commit()
+
+    def delete_month_todo(self, todo_id: int):
+        self.conn.execute("DELETE FROM month_todos WHERE id=?;", (int(todo_id),))
+        self.conn.commit()
+
+    def purge_expired_completed_daily_todos(self, anchor_dt: datetime | str | None = None):
+        anchor = start_of_day(now_local() if anchor_dt is None else (anchor_dt if isinstance(anchor_dt, datetime) else str_to_dt(str(anchor_dt) + " 00:00:00") if len(str(anchor_dt)) == 10 else now_local()))
+        cutoff = dt_to_str(anchor)
+        self.conn.execute(
+            "DELETE FROM daily_todos WHERE is_done=1 AND COALESCE(completed_ts,'') <> '' AND completed_ts < ?;",
+            (cutoff,),
+        )
+        self.conn.commit()
+
+    def toggle_daily_todo_done(self, todo_id: int, is_done: bool | None = None):
+        cur = self.conn.execute("SELECT is_done FROM daily_todos WHERE id=?;", (int(todo_id),))
+        row = cur.fetchone()
+        if not row:
+            return
+        if is_done is None:
+            is_done = not bool(row[0])
+        completed_ts = dt_to_str(now_local()) if bool(is_done) else ""
+        self.conn.execute(
+            "UPDATE daily_todos SET is_done=?, completed_ts=? WHERE id=?;",
+            (1 if bool(is_done) else 0, completed_ts, int(todo_id)),
+        )
+        self.conn.commit()
+
+    def toggle_month_todo_done(self, todo_id: int, is_done: bool | None = None):
+        self.delete_month_todo(todo_id)
 
     def update_daily_todo(self, todo_id: int, task_text: str):
         self.conn.execute(
@@ -707,8 +1015,11 @@ class TrackerDB:
         )
         self.conn.commit()
 
-    def delete_daily_todo(self, todo_id: int):
-        self.conn.execute("DELETE FROM daily_todos WHERE id=?;", (int(todo_id),))
+    def update_month_todo(self, todo_id: int, task_text: str):
+        self.conn.execute(
+            "UPDATE month_todos SET task_text=? WHERE id=?;",
+            (normalize_task_text(task_text), int(todo_id)),
+        )
         self.conn.commit()
 
     def close(self):
@@ -1918,6 +2229,11 @@ class TaskDialog(GlassDialog):
         lay.addWidget(self.txt, 1)
 
         btns = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        if allow_delete:
+            self.btn_delete = btns.addButton(delete_label, QDialogButtonBox.DestructiveRole)
+            self.btn_delete.clicked.connect(self._request_delete)
+        else:
+            self.btn_delete = None
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)
         lay.addWidget(btns)
@@ -1961,11 +2277,13 @@ class TaskDialog(GlassDialog):
 
 class PlanDialog(GlassDialog):
     TIME_OPTIONS = [f"{h:02d}:{m:02d}" for h in range(24) for m in (0, 15, 30, 45)]
+    RECURRENCE_OPTIONS = [("None", "none"), ("Every Week", "weekly"), ("Every Month", "monthly"), ("Every Year", "yearly")]
 
-    def __init__(self, parent, start_dt: datetime, end_dt: datetime, categories, preset_cat=None, preset_task=None, title="Plan Task"):
+    def __init__(self, parent, start_dt: datetime, end_dt: datetime, categories, preset_cat=None, preset_task=None, title="Plan Task", preset_recurrence: str = "none", preset_all_day: bool = False, preset_recurrence_range_start: str = "", preset_recurrence_range_end: str = "", allow_delete: bool = False, delete_label: str = "Delete"):
         super().__init__(parent)
         self.setWindowTitle(title)
-        self.resize(700, 410)
+        self.resize(700, 520)
+        self.delete_requested = False
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(14, 12, 14, 14)
@@ -2004,6 +2322,70 @@ class PlanDialog(GlassDialog):
         meta.addWidget(self.end_time_combo, 2)
         lay.addLayout(meta)
 
+        self.chk_all_day = QCheckBox("All day")
+        self.chk_all_day.setChecked(bool(preset_all_day or is_all_day_span(start_dt, end_dt)))
+        self.chk_all_day.toggled.connect(self._sync_all_day_state)
+        lay.addWidget(self.chk_all_day)
+
+        recur_row = QHBoxLayout()
+        recur_row.setSpacing(10)
+        recur_label = QLabel("Repeat")
+        recur_label.setFixedWidth(52)
+        recur_row.addWidget(recur_label, 0)
+        self.cmb_recurrence = QComboBox()
+        for label, value in self.RECURRENCE_OPTIONS:
+            self.cmb_recurrence.addItem(label, value)
+        preset_recurrence = str(preset_recurrence or 'none').strip().lower()
+        idx = max(0, self.cmb_recurrence.findData(preset_recurrence))
+        self.cmb_recurrence.setCurrentIndex(idx)
+        recur_row.addWidget(self.cmb_recurrence, 1)
+        lay.addLayout(recur_row)
+
+        self.repeat_range_wrap = QWidget()
+        range_row = QHBoxLayout(self.repeat_range_wrap)
+        range_row.setContentsMargins(0, 0, 0, 0)
+        range_row.setSpacing(8)
+        range_label = QLabel("Range")
+        range_label.setFixedWidth(44)
+        range_row.addWidget(range_label, 0)
+
+        try:
+            preset_range_start_dt = datetime.strptime(str(preset_recurrence_range_start or ''), '%Y-%m-%d')
+        except Exception:
+            preset_range_start_dt = start_of_day(start_dt)
+        try:
+            preset_range_end_dt = datetime.strptime(str(preset_recurrence_range_end or ''), '%Y-%m-%d')
+        except Exception:
+            if preset_recurrence and str(preset_recurrence).strip().lower() != 'none':
+                preset_range_end_dt = start_of_day(start_dt)
+            else:
+                preset_range_end_dt = start_of_day(end_dt)
+
+        self.recur_start_date_edit = QDateEdit(QDate(preset_range_start_dt.year, preset_range_start_dt.month, preset_range_start_dt.day))
+        self.recur_end_date_edit = QDateEdit(QDate(preset_range_end_dt.year, preset_range_end_dt.month, preset_range_end_dt.day))
+        for w in (self.recur_start_date_edit, self.recur_end_date_edit):
+            w.setCalendarPopup(True)
+            w.setDisplayFormat('yyyy-MM-dd')
+            w.setButtonSymbols(QDateEdit.UpDownArrows)
+            w.setKeyboardTracking(False)
+            w.setMinimumWidth(118)
+            w.setMaximumWidth(132)
+            w.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+            w.setFocusPolicy(Qt.StrongFocus)
+        range_row.addWidget(self.recur_start_date_edit, 0)
+        range_to = QLabel('to')
+        range_to.setFixedWidth(14)
+        range_to.setAlignment(Qt.AlignCenter)
+        range_row.addWidget(range_to, 0)
+        range_row.addWidget(self.recur_end_date_edit, 0)
+        range_row.addStretch(1)
+        lay.addWidget(self.repeat_range_wrap)
+
+        recur_hint = QLabel("Tip: birthdays can be saved as all-day yearly recurring tasks. They will appear as small labels instead of occupying the whole day block.")
+        recur_hint.setWordWrap(True)
+        recur_hint.setStyleSheet("color:rgba(90,100,120,205); font-size:12px; font-weight:600;")
+        lay.addWidget(recur_hint)
+
         self.cmb = QComboBox()
         category_items = normalize_categories(categories)
         if preset_cat:
@@ -2023,6 +2405,11 @@ class PlanDialog(GlassDialog):
         lay.addWidget(self.txt, 1)
 
         btns = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        if allow_delete:
+            self.btn_delete = btns.addButton(delete_label, QDialogButtonBox.DestructiveRole)
+            self.btn_delete.clicked.connect(self._request_delete)
+        else:
+            self.btn_delete = None
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)
         lay.addWidget(btns)
@@ -2033,7 +2420,7 @@ class PlanDialog(GlassDialog):
                 background:transparent;
                 border:none;
             }
-            QLabel{
+            QLabel, QCheckBox{
                 color:rgba(36,44,62,220);
                 font-size:13px;
                 font-weight:800;
@@ -2046,6 +2433,7 @@ class PlanDialog(GlassDialog):
                 padding:8px;
                 font-size:13px;
             }
+            QCheckBox::indicator{width:16px; height:16px;}
             QComboBox::drop-down{border:0; width:28px;}
             QDateTimeEdit::drop-down, QDateEdit::drop-down{border:0; width:26px;}
             QDialogButtonBox QPushButton{
@@ -2062,6 +2450,10 @@ class PlanDialog(GlassDialog):
             QDialogButtonBox QPushButton:hover{border:1px solid rgba(255,255,255,235);}
             """
         )
+
+        self.cmb_recurrence.currentIndexChanged.connect(self._sync_recurrence_range_state)
+        self._sync_all_day_state(self.chk_all_day.isChecked())
+        self._sync_recurrence_range_state()
 
     def _make_time_combo(self, dt: datetime) -> QComboBox:
         combo = QComboBox()
@@ -2081,7 +2473,27 @@ class PlanDialog(GlassDialog):
                 return qtime
         raise ValueError(f"{label} time must be in HH:mm format.")
 
+    def _sync_all_day_state(self, checked: bool):
+        if checked:
+            self.start_time_combo.setCurrentText("00:00")
+            self.end_time_combo.setCurrentText("23:59")
+        self.start_time_combo.setEnabled(not checked)
+        self.end_time_combo.setEnabled(not checked)
+
+    def _sync_recurrence_range_state(self):
+        enabled = self.recurrence() != 'none'
+        self.repeat_range_wrap.setVisible(enabled)
+        self.recur_start_date_edit.setEnabled(enabled)
+        self.recur_end_date_edit.setEnabled(enabled)
+
+    def _request_delete(self):
+        self.delete_requested = True
+        super().accept()
+
     def accept(self):
+        if self.delete_requested:
+            super().accept()
+            return
         try:
             start_dt = self.start_datetime()
             end_dt = self.end_datetime()
@@ -2091,17 +2503,48 @@ class PlanDialog(GlassDialog):
         if end_dt <= start_dt:
             QMessageBox.warning(self, "Invalid Time", "End time must be later than start time.")
             return
+        if self.recurrence() != 'none' and self.recurrence_range_end_date() < self.recurrence_range_start_date():
+            QMessageBox.warning(self, "Invalid Repeat Range", "Repeat end date must be on or after repeat start date.")
+            return
         super().accept()
 
     def start_datetime(self) -> datetime:
         qd = self.start_date_edit.date()
+        if self.is_all_day():
+            return datetime(qd.year(), qd.month(), qd.day(), 0, 0, 0)
         qt = self._parse_time_text(self.start_time_combo, "Start")
         return datetime(qd.year(), qd.month(), qd.day(), qt.hour(), qt.minute())
 
     def end_datetime(self) -> datetime:
         qd = self.end_date_edit.date()
+        if self.is_all_day():
+            return datetime(qd.year(), qd.month(), qd.day(), 23, 59, 0)
         qt = self._parse_time_text(self.end_time_combo, "End")
         return datetime(qd.year(), qd.month(), qd.day(), qt.hour(), qt.minute())
+
+    def is_all_day(self) -> bool:
+        return bool(self.chk_all_day.isChecked())
+
+    def recurrence(self) -> str:
+        return str(self.cmb_recurrence.currentData() or 'none')
+
+    def recurrence_range_start_date(self) -> datetime:
+        qd = self.recur_start_date_edit.date()
+        return datetime(qd.year(), qd.month(), qd.day())
+
+    def recurrence_range_end_date(self) -> datetime:
+        qd = self.recur_end_date_edit.date()
+        return datetime(qd.year(), qd.month(), qd.day())
+
+    def recurrence_range_start(self) -> str:
+        if self.recurrence() == 'none':
+            return ''
+        return self.recurrence_range_start_date().strftime('%Y-%m-%d')
+
+    def recurrence_range_end(self) -> str:
+        if self.recurrence() == 'none':
+            return ''
+        return self.recurrence_range_end_date().strftime('%Y-%m-%d')
 
     def category(self) -> str:
         return normalize_category(self.cmb.currentText().strip() or DEFAULT_CATEGORIES[0])
@@ -2109,6 +2552,45 @@ class PlanDialog(GlassDialog):
     def task_text(self) -> str:
         return normalize_task_text(self.txt.toPlainText())
 
+
+
+
+class JumpDateCalendar(QCalendarWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setHorizontalHeaderFormat(QCalendarWidget.ShortDayNames)
+
+    def paintCell(self, painter: QPainter, rect: QRect, date: QDate):
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        selected = date == self.selectedDate()
+        today = date == QDate.currentDate()
+        in_month = (date.month() == self.monthShown() and date.year() == self.yearShown())
+
+        if selected:
+            bg_rect = QRectF(rect).adjusted(4, 3, -4, -3)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(176, 182, 192, 150))
+            painter.drawRoundedRect(bg_rect, 10, 10)
+        elif today:
+            bg_rect = QRectF(rect).adjusted(6, 5, -6, -5)
+            painter.setPen(QPen(QColor(160, 168, 180, 135), 1.4))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRoundedRect(bg_rect, 9, 9)
+
+        txt_color = QColor(33, 42, 60, 240) if in_month else QColor(120, 128, 140, 180)
+        if selected:
+            txt_color = QColor(28, 38, 55, 248)
+
+        painter.setPen(txt_color)
+        font = painter.font()
+        font.setFamily('Segoe UI')
+        font.setPointSize(max(9, font.pointSize()))
+        font.setBold(selected)
+        painter.setFont(font)
+        painter.drawText(rect, Qt.AlignCenter, str(date.day()))
+        painter.restore()
 
 class DateJumpDialog(GlassDialog):
     def __init__(self, parent, current_dt: datetime):
@@ -2122,7 +2604,7 @@ class DateJumpDialog(GlassDialog):
         lay.setSpacing(10)
         lay.addWidget(DialogTitleBar(self, "Choose Date"))
 
-        self.cal = QCalendarWidget()
+        self.cal = JumpDateCalendar()
         self.cal.setLocale(QLocale(QLocale.English, QLocale.UnitedStates))
         self.cal.setGridVisible(False)
         self.cal.setVerticalHeaderFormat(QCalendarWidget.NoVerticalHeader)
@@ -2179,10 +2661,7 @@ class DateJumpDialog(GlassDialog):
                 background: rgba(255,255,255,0);
             }
             QCalendarWidget QAbstractItemView::item:selected{
-                border: 2px solid rgba(255,255,255,235);
-                border-radius: 12px;
-                font-weight: 800;
-                background: rgba(255,255,255,58);
+                background: rgba(255,255,255,0);
                 color: rgba(28,38,55,240);
             }
             QCalendarWidget QHeaderView::section{
@@ -2372,6 +2851,8 @@ class CalendarCanvas(LightGlassCard):
         self.on_pick_month_year = None
         self.on_duplicate_item_requested = None
         self.on_delete_item_requested = None
+        self.on_resize_item_requested = None
+        self.on_undo_requested = None
         self._title_hit = QRectF()
         self._month_cells: list[tuple[QRectF, datetime]] = []
         self._week_day_rects: list[tuple[QRectF, datetime]] = []
@@ -2383,6 +2864,12 @@ class CalendarCanvas(LightGlassCard):
         self._duplicate_drag_start: datetime | None = None
         self._duplicate_drag_end: datetime | None = None
         self._duplicate_drag_rect: QRectF | None = None
+        self._resize_drag_hit: dict | None = None
+        self._resize_drag_edge: str | None = None
+        self._resize_drag_start: datetime | None = None
+        self._resize_drag_end: datetime | None = None
+        self._resize_drag_rect: QRectF | None = None
+        self._resize_hover_edge: str | None = None
         self.setMouseTracking(True)
 
     def set_sessions_callback(self, fn):
@@ -2427,15 +2914,11 @@ class CalendarCanvas(LightGlassCard):
         for s in self._sessions_in_range(start_dt, end_dt):
             x = dict(s)
             x["source"] = "session"
-            x = clamp_item_to_range(x, start_dt, end_dt)
-            if x is not None:
-                items.append(x)
+            items.extend(split_item_by_day(x, start_dt, end_dt))
         for s in self._plans_in_range(start_dt, end_dt):
             x = dict(s)
             x["source"] = "plan"
-            x = clamp_item_to_range(x, start_dt, end_dt)
-            if x is not None:
-                items.append(x)
+            items.extend(split_item_by_day(x, start_dt, end_dt))
         items.sort(key=lambda item: item.get("start", ""))
         return items
 
@@ -2449,6 +2932,54 @@ class CalendarCanvas(LightGlassCard):
         if text == DEFAULT_TASK_PLACEHOLDER:
             return normalize_category(item.get("category", "Other"))
         return text
+
+    def _item_time_text(self, item: dict) -> str:
+        try:
+            ss = str_to_dt(item["start"])
+            ee = str_to_dt(item["end"])
+        except Exception:
+            return ""
+        if bool(item.get("is_all_day", False)):
+            recur = str(item.get("recurrence", "none") or "none")
+            if recur == "yearly":
+                return "All day · yearly"
+            if recur == "monthly":
+                return "All day · monthly"
+            if recur == "weekly":
+                return "All day · weekly"
+            return "All day"
+        return f"{ss.strftime('%H:%M')}-{ee.strftime('%H:%M')}"
+
+    def _calendar_item_detail_text(self, item: dict, include_category: bool = False) -> str:
+        detail = self._item_time_text(item)
+        if include_category:
+            detail = f"{detail}   {normalize_category(item.get('category', 'Other'))}"
+        return detail
+
+    def _calendar_item_show_detail(self, rect: QRectF, mode: str = 'week', include_category: bool = False) -> bool:
+        width = float(rect.width())
+        height = float(rect.height())
+        if include_category:
+            return width >= 180.0 and height >= 56.0
+        if mode == 'day':
+            return width >= 140.0 and height >= 46.0
+        return width >= 78.0 and height >= 38.0
+
+    def _is_all_day_item(self, item: dict) -> bool:
+        return bool(item.get("is_all_day", False))
+
+    def _paint_all_day_chip(self, p: QPainter, rect: QRectF, item: dict, compact: bool = False):
+        col = color_for_category(item.get("category", "Other"))
+        focused = self._is_focused_item(item)
+        if focused:
+            p.setPen(QPen(QColor(255, 255, 255, 235), 1.6))
+            p.setBrush(QColor(255, 255, 255, 28))
+            p.drawRoundedRect(rect.adjusted(-1, -1, 1, 1), 8, 8)
+        self._pill(p, rect, self._item_title_text(item)[:(12 if compact else 22)], col)
+        hit = dict(item)
+        hit["rect"] = QRectF(rect)
+        hit["resizable"] = False
+        self._item_hits.append(hit)
 
     def _is_focused_item(self, item: dict) -> bool:
         return (
@@ -2465,6 +2996,106 @@ class CalendarCanvas(LightGlassCard):
                 return hit
         return None
 
+    def _edge_hit_for_item(self, pos, hit: dict | None = None) -> tuple[dict | None, str | None]:
+        if self.mode not in (self.MODE_WEEK, self.MODE_DAY):
+            return None, None
+        target = hit if hit is not None else self._hit_item_at(pos)
+        if target is None:
+            return None, None
+        rect = target.get("rect")
+        if rect is None or not rect.contains(pos):
+            return None, None
+
+        handle_h = max(8.0, min(14.0, rect.height() * 0.28))
+        top_zone = QRectF(rect.left(), rect.top(), rect.width(), handle_h)
+        bottom_zone = QRectF(rect.left(), rect.bottom() - handle_h, rect.width(), handle_h)
+        if top_zone.contains(pos):
+            return target, "start"
+        if bottom_zone.contains(pos):
+            return target, "end"
+        return target, None
+
+    def _update_resize_cursor(self, pos):
+        if self._resize_drag_hit is not None:
+            self.setCursor(Qt.SizeVerCursor)
+            return
+        _hit, edge = self._edge_hit_for_item(pos)
+        self._resize_hover_edge = edge
+        self.setCursor(Qt.SizeVerCursor if edge else Qt.ArrowCursor)
+
+    def _snapped_datetime_from_position(self, pos, base_dt: datetime | None = None) -> datetime:
+        dt = start_of_day(base_dt or self._date_at_position(pos) or self.selected_date)
+        hour = self._hour_at_position(pos)
+        total_minutes = int(round(hour * 60.0))
+        total_minutes = max(0, min(24 * 60, total_minutes))
+        if total_minutes >= 24 * 60:
+            return dt + timedelta(days=1)
+        hh = total_minutes // 60
+        mm = total_minutes % 60
+        return dt.replace(hour=hh, minute=mm, second=0, microsecond=0)
+
+    def _proposal_from_resize_hit(self, pos, item: dict, edge: str):
+        rect = item.get("rect")
+        if rect is None or self._grid_rect is None:
+            return None, None, None
+        piece_start = str_to_dt(item.get("start"))
+        true_start = str_to_dt(item.get("true_start", item.get("start")))
+        true_end = str_to_dt(item.get("true_end", item.get("end")))
+        moving_dt = self._snapped_datetime_from_position(pos, piece_start)
+        min_delta = timedelta(minutes=1)
+
+        if edge == "start":
+            new_start = min(moving_dt, true_end - min_delta)
+            new_end = true_end
+        else:
+            new_start = true_start
+            new_end = max(moving_dt, true_start + min_delta)
+
+        if new_end <= new_start:
+            return None, None, None
+
+        display_start = max(new_start, start_of_day(piece_start))
+        display_end = min(new_end, start_of_day(piece_start) + timedelta(days=1))
+        if display_end <= display_start:
+            return new_start, new_end, None
+
+        start_hour, end_hour = hours_in_day_span(display_start, display_end)
+        view_end = self.view_start_hour + self.visible_hours
+        if end_hour <= self.view_start_hour or start_hour >= view_end:
+            return new_start, new_end, None
+
+        if self.mode == self.MODE_WEEK:
+            hour_w = 72
+            col_w = (self._grid_rect.width() - hour_w) / 7.0
+            col_index = (start_of_day(piece_start) - week_start(self.selected_date)).days
+            if col_index < 0 or col_index > 6:
+                return new_start, new_end, None
+            y1 = self._grid_rect.top() + (max(self.view_start_hour, start_hour) - self.view_start_hour) / self.visible_hours * self._grid_rect.height()
+            y2 = self._grid_rect.top() + (min(view_end, end_hour) - self.view_start_hour) / self.visible_hours * self._grid_rect.height()
+            if y2 < y1 + 20:
+                y2 = y1 + 20
+            x = self._grid_rect.left() + hour_w + col_index * col_w + 6
+            rect = QRectF(x, y1 + 4, col_w - 12, max(18.0, y2 - y1 - 8))
+            return new_start, new_end, rect
+
+        grid = self._grid_rect
+        label_w = 82
+        content_x = grid.left() + label_w
+        y1 = grid.top() + (max(self.view_start_hour, start_hour) - self.view_start_hour) / self.visible_hours * grid.height()
+        y2 = grid.top() + (min(view_end, end_hour) - self.view_start_hour) / self.visible_hours * grid.height()
+        visible_h = max(4.0, y2 - y1)
+        box_h = max(24.0, visible_h - 12)
+        rect_y = y1 + 6
+        if visible_h < 36:
+            if end_hour > view_end and start_hour >= self.view_start_hour:
+                rect_y = y1 + 6
+            elif start_hour < self.view_start_hour and end_hour <= view_end:
+                rect_y = y2 - box_h - 6
+            else:
+                rect_y = y1 + max(2.0, (visible_h - box_h) * 0.5)
+        rect = QRectF(content_x + 10, rect_y, grid.width() - label_w - 20, box_h)
+        return new_start, new_end, rect
+
     def _proposal_from_drag_hit(self, pos, item: dict):
         if self.mode != self.MODE_WEEK or self._grid_rect is None or not self._grid_rect.contains(pos):
             return None, None, None
@@ -2476,8 +3107,7 @@ class CalendarCanvas(LightGlassCard):
         end_dt = start_dt + timedelta(seconds=duration_sec)
         ss = str_to_dt(item["start"])
         ee = str_to_dt(item["end"])
-        start_hour = start_dt.hour + start_dt.minute / 60 + start_dt.second / 3600
-        end_hour = end_dt.hour + end_dt.minute / 60 + end_dt.second / 3600
+        start_hour, end_hour = hours_in_day_span(start_dt, end_dt)
         view_end = self.view_start_hour + self.visible_hours
         col_index = (start_of_day(start_dt) - week_start(self.selected_date)).days
         if col_index < 0 or col_index > 6:
@@ -2506,13 +3136,23 @@ class CalendarCanvas(LightGlassCard):
             self.update()
             e.accept()
             return
+        if self._resize_drag_hit is not None and self._resize_drag_edge is not None:
+            self.hovered_date = self._date_at_position(pos)
+            self._resize_drag_start, self._resize_drag_end, self._resize_drag_rect = self._proposal_from_resize_hit(pos, self._resize_drag_hit, self._resize_drag_edge)
+            self.setCursor(Qt.SizeVerCursor)
+            self.update()
+            e.accept()
+            return
         self.hovered_date = self._date_at_position(pos)
+        self._update_resize_cursor(pos)
         self.update()
         super().mouseMoveEvent(e)
 
     def leaveEvent(self, e):
         self.hovered_date = None
-        if self._duplicate_drag_hit is None:
+        self._resize_hover_edge = None
+        if self._duplicate_drag_hit is None and self._resize_drag_hit is None:
+            self.setCursor(Qt.ArrowCursor)
             self.update()
         super().leaveEvent(e)
 
@@ -2523,16 +3163,25 @@ class CalendarCanvas(LightGlassCard):
                 if self.on_pick_month_year:
                     self.on_pick_month_year(self.selected_date)
                 return
-            hit = self._hit_item_at(pos)
-            if hit is not None:
+            edge_hit, edge = self._edge_hit_for_item(pos)
+            if edge_hit is not None:
                 self.setFocus(Qt.MouseFocusReason)
-                self.set_focus_item(hit.get("source"), hit.get("id"))
+                self.set_focus_item(edge_hit.get("source"), edge_hit.get("id"))
                 try:
-                    self._emit_selection(start_of_day(str_to_dt(hit.get("start"))))
+                    self._emit_selection(start_of_day(str_to_dt(edge_hit.get("start"))))
                 except Exception:
                     self.update()
+                if edge is not None:
+                    self._resize_drag_hit = dict(edge_hit)
+                    self._resize_drag_edge = edge
+                    self._resize_drag_start = None
+                    self._resize_drag_end = None
+                    self._resize_drag_rect = QRectF(edge_hit.get("rect")) if edge_hit.get("rect") is not None else None
+                    self.setCursor(Qt.SizeVerCursor)
+                    e.accept()
+                    return
                 if self.mode == self.MODE_WEEK and (e.modifiers() & Qt.AltModifier):
-                    self._duplicate_drag_hit = dict(hit)
+                    self._duplicate_drag_hit = dict(edge_hit)
                     self._duplicate_drag_start = None
                     self._duplicate_drag_end = None
                     self._duplicate_drag_rect = None
@@ -2561,7 +3210,7 @@ class CalendarCanvas(LightGlassCard):
             if source == "session" and self.on_edit_session:
                 self.on_edit_session(sid)
             elif source == "plan" and self.on_edit_plan:
-                self.on_edit_plan(sid)
+                self.on_edit_plan(sid, str(hit.get("occurrence_start") or hit.get("start") or ""))
             e.accept()
             return
 
@@ -2589,6 +3238,21 @@ class CalendarCanvas(LightGlassCard):
 
 
     def mouseReleaseEvent(self, e):
+        if e.button() == Qt.LeftButton and self._resize_drag_hit is not None:
+            ret = None
+            if self.on_resize_item_requested and self._resize_drag_start is not None and self._resize_drag_end is not None:
+                ret = self.on_resize_item_requested(dict(self._resize_drag_hit), self._resize_drag_start, self._resize_drag_end)
+            self._resize_drag_hit = None
+            self._resize_drag_edge = None
+            self._resize_drag_start = None
+            self._resize_drag_end = None
+            self._resize_drag_rect = None
+            self.setCursor(Qt.ArrowCursor)
+            if isinstance(ret, tuple) and len(ret) == 2:
+                self.set_focus_item(ret[0], ret[1])
+            self.update()
+            e.accept()
+            return
         if e.button() == Qt.LeftButton and self._duplicate_drag_hit is not None:
             ret = None
             if self.on_duplicate_item_requested and self._duplicate_drag_start is not None and self._duplicate_drag_end is not None:
@@ -2635,6 +3299,11 @@ class CalendarCanvas(LightGlassCard):
         e.ignore()
 
     def keyPressEvent(self, e):
+        if (e.modifiers() & Qt.ControlModifier) and e.key() == Qt.Key_Z:
+            if self.on_undo_requested:
+                self.on_undo_requested()
+                e.accept()
+                return
         if e.key() in (Qt.Key_Delete, Qt.Key_Backspace):
             if self.focus_item_source is not None and self.focus_item_id is not None and self.on_delete_item_requested:
                 self.on_delete_item_requested(self.focus_item_source, self.focus_item_id)
@@ -2697,7 +3366,7 @@ class CalendarCanvas(LightGlassCard):
     def _proposal_from_position(self, pos, fallback_dt: datetime | None = None):
         dt = fallback_dt or self._date_at_position(pos) or self.selected_date
         hour = self._hour_at_position(pos)
-        minute = int(round((hour - int(hour)) * 60 / 15.0) * 15)
+        minute = int(round((hour - int(hour)) * 60.0))
         hour_int = int(hour)
         if minute >= 60:
             hour_int += 1
@@ -2824,11 +3493,14 @@ class CalendarCanvas(LightGlassCard):
             p.drawText(QRectF(rect.left() + 10, rect.top() + 8, rect.width() - 16, 20), Qt.AlignLeft | Qt.AlignTop, str(dt.day))
 
             day_items = by_day.get(dt, [])
+            all_day_items = [s for s in day_items if self._is_all_day_item(s)]
+            timed_items = [s for s in day_items if not self._is_all_day_item(s)]
             line_y = rect.top() + 34
-            for s in day_items[:4]:
-                text = normalize_task_text(s["task_text"])
-                if text == DEFAULT_TASK_PLACEHOLDER:
-                    text = normalize_category(s["category"])
+            for s in all_day_items[:2]:
+                pr = QRectF(rect.left() + 8, line_y, rect.width() - 16, 16)
+                self._paint_all_day_chip(p, pr, s, compact=True)
+                line_y += 18
+            for s in timed_items[: max(0, 4 - min(2, len(all_day_items)))]:
                 label = self._item_title_text(s)[:12]
                 pr = QRectF(rect.left() + 8, line_y, rect.width() - 16, 16)
                 if self._is_focused_item(s):
@@ -2838,6 +3510,7 @@ class CalendarCanvas(LightGlassCard):
                 self._pill(p, pr, label, color_for_category(s["category"]))
                 hit = dict(s)
                 hit["rect"] = QRectF(pr)
+                hit["resizable"] = False
                 self._item_hits.append(hit)
                 line_y += 18
 
@@ -2851,8 +3524,9 @@ class CalendarCanvas(LightGlassCard):
             by_day.setdefault(d, []).append(s)
 
         head_h = 54
+        all_day_h = 22
         hour_w = 72
-        grid = QRectF(area.left(), area.top() + head_h, area.width(), area.height() - head_h)
+        grid = QRectF(area.left(), area.top() + head_h + all_day_h, area.width(), area.height() - head_h - all_day_h)
         self._grid_rect = grid
         col_w = (grid.width() - hour_w) / 7.0
 
@@ -2869,6 +3543,11 @@ class CalendarCanvas(LightGlassCard):
             p.drawText(QRectF(rect.left(), rect.top() + 6, rect.width(), 16), Qt.AlignCenter, dt.strftime("%a"))
             p.setFont(ui_font(self, 12, QFont.Bold if start_of_day(self.selected_date) == dt else QFont.Medium))
             p.drawText(QRectF(rect.left(), rect.top() + 24, rect.width(), 20), Qt.AlignCenter, dt.strftime("%m-%d"))
+
+            all_day_items = [s for s in by_day.get(dt, []) if self._is_all_day_item(s)]
+            if all_day_items:
+                chip_rect = QRectF(grid.left() + hour_w + i * col_w + 6, area.top() + head_h + 2, col_w - 12, 16)
+                self._paint_all_day_chip(p, chip_rect, all_day_items[0], compact=True)
 
         p.setPen(QPen(QColor(TEXT.red(), TEXT.green(), TEXT.blue(), 38), 1))
         for idx in range(int(self.visible_hours) + 1):
@@ -2888,10 +3567,11 @@ class CalendarCanvas(LightGlassCard):
             dt = st + timedelta(days=i)
             items = by_day.get(dt, [])
             for s in items:
+                if self._is_all_day_item(s):
+                    continue
                 ss = str_to_dt(s["start"])
                 ee = str_to_dt(s["end"])
-                start_hour = ss.hour + ss.minute / 60 + ss.second / 3600
-                end_hour = ee.hour + ee.minute / 60 + ee.second / 3600
+                start_hour, end_hour = hours_in_day_span(ss, ee)
                 if end_hour <= self.view_start_hour or start_hour >= view_end:
                     continue
                 y1 = grid.top() + (max(self.view_start_hour, start_hour) - self.view_start_hour) / self.visible_hours * grid.height()
@@ -2913,13 +3593,17 @@ class CalendarCanvas(LightGlassCard):
                     p.setPen(QPen(QColor(255, 255, 255, 190 if focused else 145), 1.8 if focused else 1.0))
                     p.setBrush(QColor(col.red(), col.green(), col.blue(), 112 if focused else 98))
                 p.drawRoundedRect(rect, 12, 12)
+                show_detail = self._calendar_item_show_detail(rect, mode='week', include_category=False)
                 p.setPen(QColor(TEXT.red(), TEXT.green(), TEXT.blue(), 225))
                 p.setFont(ui_font(self, 9, QFont.Bold))
-                p.drawText(rect.adjusted(8, 4, -8, -18), Qt.TextWordWrap, self._item_title_text(s)[:28])
-                p.setFont(ui_font(self, 8))
-                p.drawText(rect.adjusted(8, rect.height() - 18, -8, -4), Qt.AlignLeft | Qt.AlignBottom, f"{ss.strftime('%H:%M')}-{ee.strftime('%H:%M')}")
+                title_rect = rect.adjusted(8, 4, -8, -18) if show_detail else rect.adjusted(8, 4, -8, -6)
+                p.drawText(title_rect, Qt.TextWordWrap, self._item_title_text(s)[:28])
+                if show_detail:
+                    p.setFont(ui_font(self, 8))
+                    p.drawText(rect.adjusted(8, rect.height() - 18, -8, -4), Qt.AlignLeft | Qt.AlignBottom, self._calendar_item_detail_text(s))
                 hit = dict(s)
-                hit["rect"] = rect
+                hit["rect"] = QRectF(rect)
+                hit["resizable"] = True
                 self._item_hits.append(hit)
 
         if self._duplicate_drag_rect is not None and self._duplicate_drag_hit is not None and self._duplicate_drag_start is not None and self._duplicate_drag_end is not None:
@@ -2928,11 +3612,29 @@ class CalendarCanvas(LightGlassCard):
             p.setPen(QPen(QColor(255, 255, 255, 235), 2.0, Qt.DashLine))
             p.setBrush(QColor(col.red(), col.green(), col.blue(), 42))
             p.drawRoundedRect(rect, 12, 12)
+            show_detail = self._calendar_item_show_detail(rect, mode='week', include_category=False)
             p.setPen(QColor(TEXT.red(), TEXT.green(), TEXT.blue(), 220))
             p.setFont(ui_font(self, 9, QFont.Bold))
-            p.drawText(rect.adjusted(8, 4, -8, -18), Qt.TextWordWrap, self._item_title_text(self._duplicate_drag_hit)[:28])
-            p.setFont(ui_font(self, 8))
-            p.drawText(rect.adjusted(8, rect.height() - 18, -8, -4), Qt.AlignLeft | Qt.AlignBottom, f"{self._duplicate_drag_start.strftime('%H:%M')}-{self._duplicate_drag_end.strftime('%H:%M')}")
+            title_rect = rect.adjusted(8, 4, -8, -18) if show_detail else rect.adjusted(8, 4, -8, -6)
+            p.drawText(title_rect, Qt.TextWordWrap, self._item_title_text(self._duplicate_drag_hit)[:28])
+            if show_detail:
+                p.setFont(ui_font(self, 8))
+                p.drawText(rect.adjusted(8, rect.height() - 18, -8, -4), Qt.AlignLeft | Qt.AlignBottom, f"{self._duplicate_drag_start.strftime('%H:%M')}-{self._duplicate_drag_end.strftime('%H:%M')}")
+
+        if self._resize_drag_rect is not None and self._resize_drag_hit is not None and self._resize_drag_start is not None and self._resize_drag_end is not None:
+            col = color_for_category(self._resize_drag_hit.get("category", "Other"))
+            rect = self._resize_drag_rect
+            p.setPen(QPen(QColor(255, 255, 255, 240), 2.0, Qt.DashLine))
+            p.setBrush(QColor(col.red(), col.green(), col.blue(), 52))
+            p.drawRoundedRect(rect, 12, 12)
+            show_detail = self._calendar_item_show_detail(rect, mode='week', include_category=False)
+            p.setPen(QColor(TEXT.red(), TEXT.green(), TEXT.blue(), 220))
+            p.setFont(ui_font(self, 9, QFont.Bold))
+            title_rect = rect.adjusted(8, 4, -8, -18) if show_detail else rect.adjusted(8, 4, -8, -6)
+            p.drawText(title_rect, Qt.TextWordWrap, self._item_title_text(self._resize_drag_hit)[:28])
+            if show_detail:
+                p.setFont(ui_font(self, 8))
+                p.drawText(rect.adjusted(8, rect.height() - 18, -8, -4), Qt.AlignLeft | Qt.AlignBottom, f"{self._resize_drag_start.strftime('%H:%M')}-{self._resize_drag_end.strftime('%H:%M')}")
 
     def _paint_day(self, p: QPainter, area: QRectF):
         d0 = start_of_day(self.selected_date)
@@ -2945,10 +3647,19 @@ class CalendarCanvas(LightGlassCard):
         p.setFont(ui_font(self, 13, QFont.Bold))
         p.drawText(header, Qt.AlignCenter, self.selected_date.strftime("%Y-%m-%d  %A"))
 
-        grid = QRectF(area.left(), area.top() + 48, area.width(), area.height() - 48)
+        all_day_h = 24
+        grid = QRectF(area.left(), area.top() + 48 + all_day_h, area.width(), area.height() - 48 - all_day_h)
         self._grid_rect = grid
         label_w = 82
         content_x = grid.left() + label_w
+
+        all_day_items = [s for s in sessions if self._is_all_day_item(s)]
+        chip_x = content_x + 10
+        chip_y = area.top() + 52
+        for s in all_day_items[:3]:
+            chip_rect = QRectF(chip_x, chip_y, min(220.0, area.width() - label_w - 24), 16)
+            self._paint_all_day_chip(p, chip_rect, s, compact=False)
+            chip_x += chip_rect.width() + 8
 
         p.setPen(QPen(QColor(TEXT.red(), TEXT.green(), TEXT.blue(), 36), 1))
         for idx in range(int(self.visible_hours) + 1):
@@ -2964,10 +3675,11 @@ class CalendarCanvas(LightGlassCard):
 
         view_end = self.view_start_hour + self.visible_hours
         for s in sessions:
+            if self._is_all_day_item(s):
+                continue
             ss = str_to_dt(s["start"])
             ee = str_to_dt(s["end"])
-            start_h = ss.hour + ss.minute / 60 + ss.second / 3600
-            end_h = ee.hour + ee.minute / 60 + ee.second / 3600
+            start_h, end_h = hours_in_day_span(ss, ee)
             if end_h <= self.view_start_hour or start_h >= view_end:
                 continue
             y1 = grid.top() + (max(self.view_start_hour, start_h) - self.view_start_hour) / self.visible_hours * grid.height()
@@ -2999,14 +3711,33 @@ class CalendarCanvas(LightGlassCard):
             p.setBrush(col)
             p.setPen(Qt.NoPen)
             p.drawRoundedRect(QRectF(rect.left() + 8, rect.top() + 8, 4, rect.height() - 16), 2, 2)
+            show_detail = self._calendar_item_show_detail(rect, mode='day', include_category=True)
             p.setPen(QColor(TEXT.red(), TEXT.green(), TEXT.blue(), 230))
             p.setFont(ui_font(self, 11, QFont.Bold))
-            p.drawText(rect.adjusted(18, 8, -10, -28), Qt.TextWordWrap, self._item_title_text(s))
-            p.setFont(ui_font(self, 9))
-            p.drawText(rect.adjusted(18, rect.height() - 24, -10, -8), Qt.AlignLeft | Qt.AlignBottom, f"{ss.strftime('%H:%M')}-{ee.strftime('%H:%M')}   {normalize_category(s['category'])}")
+            title_rect = rect.adjusted(18, 8, -10, -28) if show_detail else rect.adjusted(18, 8, -10, -10)
+            p.drawText(title_rect, Qt.TextWordWrap, self._item_title_text(s))
+            if show_detail:
+                p.setFont(ui_font(self, 9))
+                p.drawText(rect.adjusted(18, rect.height() - 24, -10, -8), Qt.AlignLeft | Qt.AlignBottom, self._calendar_item_detail_text(s, include_category=True))
             hit = dict(s)
-            hit["rect"] = rect
+            hit["rect"] = QRectF(rect)
+            hit["resizable"] = True
             self._item_hits.append(hit)
+
+        if self._resize_drag_rect is not None and self._resize_drag_hit is not None and self._resize_drag_start is not None and self._resize_drag_end is not None:
+            col = color_for_category(self._resize_drag_hit.get("category", "Other"))
+            rect = self._resize_drag_rect
+            p.setPen(QPen(QColor(255, 255, 255, 240), 2.0, Qt.DashLine))
+            p.setBrush(QColor(col.red(), col.green(), col.blue(), 52))
+            p.drawRoundedRect(rect, 12, 12)
+            show_detail = self._calendar_item_show_detail(rect, mode='day', include_category=True)
+            p.setPen(QColor(TEXT.red(), TEXT.green(), TEXT.blue(), 220))
+            p.setFont(ui_font(self, 11, QFont.Bold))
+            title_rect = rect.adjusted(18, 8, -10, -28) if show_detail else rect.adjusted(18, 8, -10, -10)
+            p.drawText(title_rect, Qt.TextWordWrap, self._item_title_text(self._resize_drag_hit))
+            if show_detail:
+                p.setFont(ui_font(self, 9))
+                p.drawText(rect.adjusted(18, rect.height() - 24, -10, -8), Qt.AlignLeft | Qt.AlignBottom, f"{self._resize_drag_start.strftime('%H:%M')}-{self._resize_drag_end.strftime('%H:%M')}   {normalize_category(self._resize_drag_hit['category'])}")
 
 
 # ---------------- task list ----------------
@@ -3064,20 +3795,38 @@ class TaskTableCard(LightGlassCard):
 
 # ---------------- today task card ----------------
 class TodayTaskCard(LightGlassCard):
+    MODE_TODAY = "today"
+    MODE_MONTH = "month"
+
     def __init__(self, parent=None):
         super().__init__(radius=28, parent=parent)
+        self.view_mode = self.MODE_TODAY
+        self.anchor_date = start_of_day(now_local())
+        self.on_mode_changed = None
+
         lay = QVBoxLayout(self)
         lay.setContentsMargins(16, 16, 16, 16)
         lay.setSpacing(8)
 
+        header_row = QHBoxLayout()
+        header_row.setSpacing(8)
         self.title = QLabel("Today's Tasks")
         self.title.setStyleSheet("color:rgba(33,42,60,235); font-weight:800;")
-        lay.addWidget(self.title)
+        header_row.addWidget(self.title)
+        header_row.addStretch(1)
+
+        self.btn_today = QPushButton("Today")
+        self.btn_month = QPushButton("Month")
+        for btn in (self.btn_today, self.btn_month):
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setFixedHeight(24)
+            header_row.addWidget(btn)
+        lay.addLayout(header_row)
 
         input_row = QHBoxLayout()
         input_row.setSpacing(8)
         self.input = QLineEdit()
-        self.input.setPlaceholderText("Type a task for today…")
+        self.input.setPlaceholderText("Type a today task…")
         self.input.setClearButtonEnabled(True)
         self.input.setStyleSheet(
             """
@@ -3134,8 +3883,57 @@ class TodayTaskCard(LightGlassCard):
         )
         lay.addWidget(self.table, 1)
 
-    def set_tasks(self, day_dt: datetime, tasks):
-        self.title.setText(f"Today's Tasks  ·  {day_key_from(day_dt)}")
+        self.btn_today.clicked.connect(lambda: self.set_view_mode(self.MODE_TODAY, emit=True))
+        self.btn_month.clicked.connect(lambda: self.set_view_mode(self.MODE_MONTH, emit=True))
+        self._sync_mode_controls()
+
+    def _compact_button_style(self, active: bool = False) -> str:
+        if active:
+            bg0 = f"rgba({MINT.red()},{MINT.green()},{MINT.blue()},160)"
+            bg1 = f"rgba({PURPLE.red()},{PURPLE.green()},{PURPLE.blue()},145)"
+            border = "rgba(255,255,255,220)"
+        else:
+            bg0 = "rgba(255,255,255,126)"
+            bg1 = "rgba(255,255,255,82)"
+            border = "rgba(255,255,255,192)"
+        return f"""
+            QPushButton{{
+                background:qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 {bg0}, stop:1 {bg1});
+                color:rgba(28,38,55,235);
+                border:1px solid {border};
+                border-radius:10px;
+                padding:0px 8px;
+                font-size:9px;
+                font-weight:800;
+            }}
+            QPushButton:hover{{border:1px solid rgba(255,255,255,232);}}
+            QPushButton:pressed{{background:rgba(255,255,255,145);}}
+        """
+
+    def set_view_mode(self, mode: str, emit: bool = False):
+        if mode not in (self.MODE_TODAY, self.MODE_MONTH):
+            mode = self.MODE_TODAY
+        self.view_mode = mode
+        self._sync_mode_controls()
+        if emit and self.on_mode_changed:
+            self.on_mode_changed(self.view_mode)
+
+    def _sync_mode_controls(self):
+        self.btn_today.setStyleSheet(self._compact_button_style(active=(self.view_mode == self.MODE_TODAY)))
+        self.btn_month.setStyleSheet(self._compact_button_style(active=(self.view_mode == self.MODE_MONTH)))
+        if self.view_mode == self.MODE_MONTH:
+            self.input.setPlaceholderText("Type a month task…")
+        else:
+            self.input.setPlaceholderText("Type a today task…")
+
+    def set_tasks(self, day_dt: datetime, tasks, mode: str | None = None):
+        if mode is not None:
+            self.set_view_mode(mode, emit=False)
+        self.anchor_date = start_of_day(day_dt)
+        if self.view_mode == self.MODE_MONTH:
+            self.title.setText(f"Month Tasks  ·  {self.anchor_date.strftime('%Y-%m')}")
+        else:
+            self.title.setText(f"Today's Tasks  ·  {day_key_from(self.anchor_date)}")
         self.table.setRowCount(0)
         for task in tasks or []:
             row = self.table.rowCount()
@@ -3144,7 +3942,15 @@ class TodayTaskCard(LightGlassCard):
 
             id_item = QTableWidgetItem(str(task["id"]))
             mark_item = QTableWidgetItem("●" if task.get("is_done") else "○")
-            text_item = QTableWidgetItem(str(task.get("task_text", "")).strip())
+
+            task_text = str(task.get("task_text", "")).strip()
+            if self.view_mode == self.MODE_MONTH:
+                prefix = str(task.get("task_date", ""))[5:10]
+                task_text = f"[{prefix}] {task_text}" if prefix else task_text
+            elif task.get("is_carryover"):
+                prefix = str(task.get("task_date", ""))[5:10]
+                task_text = f"↺ [{prefix}] {task_text}" if prefix else f"↺ {task_text}"
+            text_item = QTableWidgetItem(task_text)
 
             mark_item.setTextAlignment(Qt.AlignCenter)
             for item in (id_item, mark_item, text_item):
@@ -3160,6 +3966,9 @@ class TodayTaskCard(LightGlassCard):
                 text_item.setFont(text_font)
                 mark_item.setForeground(QColor(150, 156, 166))
                 text_item.setForeground(QColor(150, 156, 166))
+            elif task.get("is_carryover"):
+                mark_item.setForeground(QColor(MINT.red(), MINT.green(), MINT.blue(), 225))
+                text_item.setForeground(QColor(TEXT.red(), TEXT.green(), TEXT.blue(), 215))
             else:
                 mark_item.setForeground(QColor(PURPLE.red(), PURPLE.green(), PURPLE.blue(), 220))
                 text_item.setForeground(QColor(TEXT.red(), TEXT.green(), TEXT.blue(), 235))
@@ -3167,6 +3976,7 @@ class TodayTaskCard(LightGlassCard):
             self.table.setItem(row, 0, id_item)
             self.table.setItem(row, 1, mark_item)
             self.table.setItem(row, 2, text_item)
+
 
 
 # ---------------- main window ----------------
@@ -3185,6 +3995,9 @@ class MainWindow(QMainWindow):
         self._start_hidden_to_tray = "--tray" in sys.argv
         self.range_stats_scope_mode = StatsWidget.SCOPE_MONTH
         self.today_task_date = start_of_day(now_local())
+        self.today_task_mode = self.db.get_state("today_task_mode", TodayTaskCard.MODE_TODAY) or TodayTaskCard.MODE_TODAY
+        self._today_task_day_key = day_key_from(self.today_task_date)
+        self._undo_stack: list[list[dict]] = []
 
         self.setWindowTitle(APP_NAME)
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window | Qt.WindowStaysOnBottomHint)
@@ -3370,6 +4183,7 @@ class MainWindow(QMainWindow):
             self.task_card.update()
         if hasattr(self, "today_task_card"):
             self.today_task_card.btn_add.setStyleSheet(glass_button_style())
+            self.today_task_card._sync_mode_controls()
             self.today_task_card.update()
 
     def open_settings_dialog(self):
@@ -3459,6 +4273,10 @@ class MainWindow(QMainWindow):
             apply_scaled_font(self.today_task_card.title, 12)
             apply_scaled_font(self.today_task_card.input, 10.5)
             apply_scaled_font(self.today_task_card.btn_add, 10.5)
+            apply_scaled_font(self.today_task_card.btn_today, 9.2)
+            apply_scaled_font(self.today_task_card.btn_month, 9.2)
+            self.today_task_card.btn_today.setFixedHeight(sp(self, 24))
+            self.today_task_card.btn_month.setFixedHeight(sp(self, 24))
             apply_scaled_font(self.today_task_card.table, 10)
             self.today_task_card.table.verticalHeader().setDefaultSectionSize(sp(self, 34))
         apply_scaled_font(self.task_card.table.horizontalHeader(), 10)
@@ -3523,6 +4341,8 @@ class MainWindow(QMainWindow):
         self.calendar.on_pick_month_year = self.pick_calendar_month
         self.calendar.on_duplicate_item_requested = self.duplicate_calendar_item
         self.calendar.on_delete_item_requested = self.delete_calendar_item
+        self.calendar.on_undo_requested = self.undo_last_delete
+        self.calendar.on_resize_item_requested = self.resize_calendar_item
 
         left_wrap = QVBoxLayout()
         left_wrap.setContentsMargins(0, 0, 0, 0)
@@ -3579,6 +4399,8 @@ class MainWindow(QMainWindow):
         self.task_card = TaskTableCard()
         right_col.addWidget(self.task_card, 2)
 
+        self.today_task_card.set_view_mode(self.today_task_mode, emit=False)
+        self.today_task_card.on_mode_changed = self._on_today_task_mode_changed
         self.today_task_card.btn_add.clicked.connect(self.add_today_task)
         self.today_task_card.input.returnPressed.connect(self.add_today_task)
         self.today_task_card.table.cellClicked.connect(self._on_today_task_cell_clicked)
@@ -3676,9 +4498,17 @@ class MainWindow(QMainWindow):
         self.range_stats_scope_mode = mode
         self._refresh_range_stats()
 
+    def _on_today_task_mode_changed(self, mode: str):
+        self.today_task_mode = mode if mode in (TodayTaskCard.MODE_TODAY, TodayTaskCard.MODE_MONTH) else TodayTaskCard.MODE_TODAY
+        self.db.set_state("today_task_mode", self.today_task_mode)
+        self.refresh_all()
+
     def _today_task_items(self):
         self.today_task_date = start_of_day(now_local())
-        return self.db.get_daily_todos(self.today_task_date)
+        self.db.purge_expired_completed_daily_todos(self.today_task_date)
+        if self.today_task_mode == TodayTaskCard.MODE_MONTH:
+            return self.db.get_month_todos_for_display(self.today_task_date)
+        return self.db.get_daily_todos_for_display(self.today_task_date)
 
     def add_today_task(self):
         if not hasattr(self, "today_task_card"):
@@ -3686,7 +4516,11 @@ class MainWindow(QMainWindow):
         text_value = self.today_task_card.input.text().strip()
         if not text_value:
             return
-        self.db.add_daily_todo(start_of_day(now_local()), text_value)
+        anchor = start_of_day(now_local())
+        if self.today_task_mode == TodayTaskCard.MODE_MONTH:
+            self.db.add_month_todo(anchor, text_value)
+        else:
+            self.db.add_daily_todo(anchor, text_value)
         self.today_task_card.input.clear()
         self.refresh_all()
 
@@ -3696,7 +4530,11 @@ class MainWindow(QMainWindow):
         item = self.today_task_card.table.item(row, 0)
         if item is None:
             return
-        self.db.toggle_daily_todo_done(int(item.text()))
+        todo_id = int(item.text())
+        if self.today_task_mode == TodayTaskCard.MODE_MONTH:
+            self.db.toggle_month_todo_done(todo_id)
+        else:
+            self.db.toggle_daily_todo_done(todo_id)
         self.refresh_all()
 
     def _selected_today_task_ids(self) -> list[int]:
@@ -3738,7 +4576,7 @@ class MainWindow(QMainWindow):
             return
         value, ok = QInputDialog.getText(
             self,
-            "Edit Today's Task",
+            "Edit Task",
             "Task text:",
             text=str(task.get("task_text", "")),
         )
@@ -3748,7 +4586,10 @@ class MainWindow(QMainWindow):
         if not new_text:
             QMessageBox.information(self, "Task text required", "Task text cannot be empty.")
             return
-        self.db.update_daily_todo(int(task["id"]), new_text)
+        if self.today_task_mode == TodayTaskCard.MODE_MONTH:
+            self.db.update_month_todo(int(task["id"]), new_text)
+        else:
+            self.db.update_daily_todo(int(task["id"]), new_text)
         self.refresh_all()
         table = self.today_task_card.table
         for r in range(table.rowCount()):
@@ -3761,7 +4602,10 @@ class MainWindow(QMainWindow):
         if not todo_ids:
             return
         for todo_id in todo_ids:
-            self.db.delete_daily_todo(int(todo_id))
+            if self.today_task_mode == TodayTaskCard.MODE_MONTH:
+                self.db.delete_month_todo(int(todo_id))
+            else:
+                self.db.delete_daily_todo(int(todo_id))
         self.refresh_all()
 
     def _on_today_task_cell_clicked(self, row: int, col: int):
@@ -3817,38 +4661,211 @@ class MainWindow(QMainWindow):
         dlg = PlanDialog(self, start_dt, end_dt, self.categories, title="Add Planned Task")
         dlg.move(self.geometry().center() - dlg.rect().center())
         if dlg.exec() == QDialog.Accepted:
-            self.db.add_plan(dlg.start_datetime(), dlg.end_datetime(), dlg.category(), dlg.task_text())
+            self.db.add_plan(dlg.start_datetime(), dlg.end_datetime(), dlg.category(), dlg.task_text(), dlg.recurrence(), dlg.is_all_day(), dlg.recurrence_range_start(), dlg.recurrence_range_end())
             self.selected_date = start_of_day(dlg.start_datetime())
             self.calendar.set_selected_date(self.selected_date)
             self.refresh_all()
 
-    def edit_plan_by_id(self, pid: int):
+
+    def _split_recurring_plan_from_occurrence(self, pid: int, occurrence_day: str, new_start: datetime, new_end: datetime, category: str, task_text: str, recurrence: str, is_all_day: bool, recurrence_range_end: str):
+        original = self.db.get_plan_by_id(pid)
+        if not original:
+            return
+        prev_day = previous_day_text(occurrence_day)
+        if prev_day:
+            self.db.update_plan(
+                pid,
+                str_to_dt(original['start']),
+                str_to_dt(original['end']),
+                normalize_category(original.get('category', DEFAULT_CATEGORIES[0])),
+                normalize_task_text(original.get('task_text', '')),
+                original.get('recurrence', 'none'),
+                bool(original.get('is_all_day', False)),
+                original.get('recurrence_range_start', ''),
+                prev_day,
+            )
+        self.db.add_plan(new_start, new_end, category, task_text, recurrence, is_all_day, occurrence_day, recurrence_range_end)
+
+    def _delete_recurring_plan_from_occurrence(self, pid: int, occurrence_day: str):
+        original = self.db.get_plan_by_id(pid)
+        if not original:
+            return
+        series_start = str(original.get('recurrence_range_start', '') or '')
+        try:
+            base_start_day = str_to_dt(original['start']).strftime('%Y-%m-%d')
+        except Exception:
+            base_start_day = ''
+        if same_day_text(occurrence_day, series_start or base_start_day):
+            self.db.delete_plan(pid)
+            return
+        prev_day = previous_day_text(occurrence_day)
+        if not prev_day:
+            self.db.delete_plan(pid)
+            return
+        self.db.update_plan(
+            pid,
+            str_to_dt(original['start']),
+            str_to_dt(original['end']),
+            normalize_category(original.get('category', DEFAULT_CATEGORIES[0])),
+            normalize_task_text(original.get('task_text', '')),
+            original.get('recurrence', 'none'),
+            bool(original.get('is_all_day', False)),
+            original.get('recurrence_range_start', ''),
+            prev_day,
+        )
+
+    def _replace_recurring_occurrence_with_single_override(self, pid: int, occurrence_day: str, new_start: datetime, new_end: datetime, category: str, task_text: str):
+        original = self.db.get_plan_by_id(pid)
+        if not original:
+            return None
+        recurrence = str(original.get('recurrence', 'none') or 'none').strip().lower()
+        if recurrence in {'', 'none'}:
+            self.db.update_plan(pid, new_start, new_end, category, task_text, 'none', bool(original.get('is_all_day', False)), '', '')
+            return int(pid)
+
+        try:
+            occ_day_dt = datetime.strptime(str(occurrence_day), '%Y-%m-%d')
+        except Exception:
+            self.db.update_plan(pid, new_start, new_end, category, task_text, 'none', bool(original.get('is_all_day', False)), '', '')
+            return int(pid)
+
+        series_start_raw = str(original.get('recurrence_range_start', '') or '').strip()
+        series_end_raw = str(original.get('recurrence_range_end', '') or '').strip()
+        try:
+            series_start_dt = datetime.strptime(series_start_raw, '%Y-%m-%d') if series_start_raw else start_of_day(str_to_dt(original['start']))
+        except Exception:
+            series_start_dt = start_of_day(str_to_dt(original['start']))
+        try:
+            series_end_dt = datetime.strptime(series_end_raw, '%Y-%m-%d') if series_end_raw else series_start_dt
+        except Exception:
+            series_end_dt = series_start_dt
+
+        before_end_dt = occ_day_dt - timedelta(days=1)
+        after_start_dt = occ_day_dt + timedelta(days=1)
+
+        if before_end_dt >= series_start_dt:
+            self.db.update_plan(
+                pid,
+                str_to_dt(original['start']),
+                str_to_dt(original['end']),
+                normalize_category(original.get('category', DEFAULT_CATEGORIES[0])),
+                normalize_task_text(original.get('task_text', '')),
+                recurrence,
+                bool(original.get('is_all_day', False)),
+                series_start_dt.strftime('%Y-%m-%d'),
+                before_end_dt.strftime('%Y-%m-%d'),
+            )
+        else:
+            self.db.delete_plan(pid)
+
+        if after_start_dt <= series_end_dt:
+            self.db.add_plan(
+                str_to_dt(original['start']),
+                str_to_dt(original['end']),
+                normalize_category(original.get('category', DEFAULT_CATEGORIES[0])),
+                normalize_task_text(original.get('task_text', '')),
+                recurrence,
+                bool(original.get('is_all_day', False)),
+                after_start_dt.strftime('%Y-%m-%d'),
+                series_end_dt.strftime('%Y-%m-%d'),
+            )
+
+        return int(self.db.add_plan(new_start, new_end, category, task_text, 'none', False, '', ''))
+
+    def edit_plan_by_id(self, pid: int, occurrence_start_text: str = ""):
         sess = self.db.get_plan_by_id(pid)
         if not sess:
             return
         start_dt = str_to_dt(sess["start"])
         end_dt = str_to_dt(sess["end"])
+        recurrence = str(sess.get("recurrence", "none") or "none").strip().lower()
+        occurrence_start_dt = None
+        if occurrence_start_text:
+            try:
+                occurrence_start_dt = str_to_dt(str(occurrence_start_text))
+            except Exception:
+                occurrence_start_dt = None
+        if occurrence_start_dt is None:
+            occurrence_start_dt = start_dt
+        occurrence_day = start_of_day(occurrence_start_dt).strftime('%Y-%m-%d')
+        is_following_edit = recurrence != 'none' and occurrence_day != start_of_day(start_dt).strftime('%Y-%m-%d')
+        dialog_start = occurrence_start_dt
+        dialog_end = occurrence_start_dt + (end_dt - start_dt)
+        delete_label = "Delete This & Following" if recurrence != 'none' else "Delete"
         dlg = PlanDialog(
             self,
-            start_dt,
-            end_dt,
+            dialog_start,
+            dialog_end,
             self.categories,
             preset_cat=normalize_category(sess["category"]),
             preset_task=normalize_task_text(sess["task_text"]),
             title=f"Edit Planned Task (ID {pid})",
+            preset_recurrence=sess.get("recurrence", "none"),
+            preset_all_day=bool(sess.get("is_all_day", False)),
+            preset_recurrence_range_start=(occurrence_day if is_following_edit else sess.get("recurrence_range_start", "")),
+            preset_recurrence_range_end=sess.get("recurrence_range_end", ""),
+            allow_delete=True,
+            delete_label=delete_label,
         )
         dlg.move(self.geometry().center() - dlg.rect().center())
-        if dlg.exec() == QDialog.Accepted:
-            self.db.update_plan(pid, dlg.start_datetime(), dlg.end_datetime(), dlg.category(), dlg.task_text())
-            self.selected_date = start_of_day(dlg.start_datetime())
-            self.calendar.set_selected_date(self.selected_date)
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        if dlg.delete_requested:
+            if recurrence != 'none' and is_following_edit:
+                if QMessageBox.question(self, "Delete Recurring Events", "Delete this occurrence and all following occurrences?") == QMessageBox.Yes:
+                    self._delete_recurring_plan_from_occurrence(pid, occurrence_day)
+            else:
+                if QMessageBox.question(self, "Delete Planned Task", "Delete this planned task?") == QMessageBox.Yes:
+                    self.db.delete_plan(pid)
+            self.calendar.set_focus_item(None, None)
             self.refresh_all()
+            return
+
+        new_start = dlg.start_datetime()
+        new_end = dlg.end_datetime()
+        if recurrence != 'none' and is_following_edit:
+            choice = QMessageBox(self)
+            choice.setWindowTitle("Recurring Event")
+            choice.setText("Apply this change to the whole series, or from this occurrence forward?")
+            whole_btn = choice.addButton("Whole Series", QMessageBox.AcceptRole)
+            following_btn = choice.addButton("This & Following", QMessageBox.ActionRole)
+            cancel_btn = choice.addButton(QMessageBox.Cancel)
+            choice.exec()
+            clicked = choice.clickedButton()
+            if clicked == cancel_btn or clicked is None:
+                return
+            if clicked == following_btn:
+                self._split_recurring_plan_from_occurrence(
+                    pid,
+                    occurrence_day,
+                    new_start,
+                    new_end,
+                    dlg.category(),
+                    dlg.task_text(),
+                    dlg.recurrence(),
+                    dlg.is_all_day(),
+                    dlg.recurrence_range_end(),
+                )
+            else:
+                self.db.update_plan(pid, new_start, new_end, dlg.category(), dlg.task_text(), dlg.recurrence(), dlg.is_all_day(), dlg.recurrence_range_start(), dlg.recurrence_range_end())
+        else:
+            self.db.update_plan(pid, new_start, new_end, dlg.category(), dlg.task_text(), dlg.recurrence(), dlg.is_all_day(), dlg.recurrence_range_start(), dlg.recurrence_range_end())
+        self.selected_date = start_of_day(new_start)
+        self.calendar.set_selected_date(self.selected_date)
+        self.refresh_all()
 
     def _tick(self):
         if self.running:
             self.timer.set_elapsed(int(time.monotonic() - self.running.start_monotonic))
         else:
             self.timer.set_elapsed(0)
+
+        current_day_key = day_key_from(now_local())
+        if current_day_key != self._today_task_day_key:
+            self._today_task_day_key = current_day_key
+            self.db.purge_expired_completed_daily_todos(start_of_day(now_local()))
+            self.refresh_all()
 
     def refresh_table(self, sessions):
         table = self.task_card.table
@@ -3913,17 +4930,81 @@ class MainWindow(QMainWindow):
                 refs.append((source_item.text(), int(id_item.text())))
         return refs
 
+    def _snapshot_refs_for_undo(self, refs: list[tuple[str, int]]) -> list[dict]:
+        snapshots: list[dict] = []
+        seen: set[tuple[str, int]] = set()
+        for source, rid in refs:
+            key = (str(source), int(rid))
+            if key in seen:
+                continue
+            seen.add(key)
+            if source == "plan":
+                record = self.db.get_plan_by_id(int(rid))
+            else:
+                record = self.db.get_session_by_id(int(rid))
+            if not record:
+                continue
+            snapshots.append(
+                {
+                    "source": "plan" if source == "plan" else "session",
+                    "start": record["start"],
+                    "end": record["end"],
+                    "category": normalize_category(record.get("category", DEFAULT_CATEGORIES[0])),
+                    "task_text": normalize_task_text(record.get("task_text", "")),
+                    "recurrence": record.get("recurrence", "none"),
+                    "is_all_day": bool(record.get("is_all_day", False)),
+                    "recurrence_range_start": record.get("recurrence_range_start", ""),
+                    "recurrence_range_end": record.get("recurrence_range_end", ""),
+                }
+            )
+        return snapshots
+
+    def _push_deleted_items_undo(self, snapshots: list[dict]):
+        clean = [dict(item) for item in snapshots if item]
+        if not clean:
+            return
+        self._undo_stack.append(clean)
+        if len(self._undo_stack) > 30:
+            self._undo_stack = self._undo_stack[-30:]
+
+    def undo_last_delete(self):
+        if not self._undo_stack:
+            return
+        snapshots = self._undo_stack.pop()
+        last_ref = None
+        for item in snapshots:
+            try:
+                start_dt = str_to_dt(item["start"])
+                end_dt = str_to_dt(item["end"])
+            except Exception:
+                continue
+            category = normalize_category(item.get("category", DEFAULT_CATEGORIES[0]))
+            task_text = normalize_task_text(item.get("task_text", ""))
+            if item.get("source") == "plan":
+                new_id = self.db.add_plan(start_dt, end_dt, category, task_text, item.get("recurrence", "none"), bool(item.get("is_all_day", False)), item.get("recurrence_range_start", ""), item.get("recurrence_range_end", ""))
+                last_ref = ("plan", new_id)
+            else:
+                new_id = self.db.add_session(start_dt, end_dt, category, task_text)
+                last_ref = ("session", new_id)
+        if last_ref is not None:
+            self.selected_date = start_of_day(str_to_dt(snapshots[-1]["start"]))
+            self.calendar.set_selected_date(self.selected_date)
+            self.calendar.set_focus_item(last_ref[0], last_ref[1])
+        self.refresh_all()
+
     def _delete_selected_refs(self, refs: list[tuple[str, int]]):
         if not refs:
             return
         label = "item" if len(refs) == 1 else "items"
         if QMessageBox.question(self, "Confirm Delete", f"Delete {len(refs)} selected {label}?") != QMessageBox.Yes:
             return
+        snapshots = self._snapshot_refs_for_undo(refs)
         for source, rid in refs:
             if source == "plan":
                 self.db.delete_plan(rid)
             else:
                 self.db.delete_session(rid)
+        self._push_deleted_items_undo(snapshots)
         self.refresh_all()
 
     def _on_table_menu(self, pos):
@@ -3957,10 +5038,17 @@ class MainWindow(QMainWindow):
         self._delete_selected_refs(self._selected_row_refs())
 
     def eventFilter(self, obj, event):
-        if obj is self.task_card.table and event.type() == QEvent.KeyPress and event.key() == Qt.Key_Delete:
-            self.request_delete_selected()
-            return True
+        if obj is self.task_card.table and event.type() == QEvent.KeyPress:
+            if (event.modifiers() & Qt.ControlModifier) and event.key() == Qt.Key_Z:
+                self.undo_last_delete()
+                return True
+            if event.key() == Qt.Key_Delete:
+                self.request_delete_selected()
+                return True
         if hasattr(self, "today_task_card") and obj is self.today_task_card.table and event.type() == QEvent.KeyPress:
+            if (event.modifiers() & Qt.ControlModifier) and event.key() == Qt.Key_Z:
+                self.undo_last_delete()
+                return True
             if event.key() in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space):
                 self._toggle_today_task_by_row(self.today_task_card.table.currentRow())
                 return True
@@ -3995,6 +5083,8 @@ class MainWindow(QMainWindow):
             preset_cat=normalize_category(sess["category"]),
             preset_task=normalize_task_text(sess["task_text"]),
             title=f"Edit Task (ID {sid})",
+            preset_recurrence="none",
+            preset_all_day=is_all_day_span(start_dt, end_dt),
         )
         dlg.move(self.geometry().center() - dlg.rect().center())
         if dlg.exec() == QDialog.Accepted:
@@ -4006,6 +5096,38 @@ class MainWindow(QMainWindow):
             self.calendar.set_focus_item("session", sid)
             self.refresh_all()
 
+    def resize_calendar_item(self, item: dict, start_dt: datetime, end_dt: datetime):
+        if end_dt <= start_dt:
+            return None
+        source = str(item.get("source", "session"))
+        rid = int(item.get("id", -1))
+        if rid < 0:
+            return None
+        if source == "plan":
+            original = self.db.get_plan_by_id(rid)
+        else:
+            original = self.db.get_session_by_id(rid)
+        if not original:
+            return None
+        category = normalize_category(original.get("category", DEFAULT_CATEGORIES[0]))
+        task_text = normalize_task_text(original.get("task_text", ""))
+        focus_source = source
+        focus_id = rid
+        if source == "plan":
+            recurrence = str(original.get("recurrence", "none") or "none").strip().lower()
+            occurrence_day = str(item.get("occurrence_day", "") or "").strip()
+            if recurrence not in {"", "none"} and occurrence_day:
+                focus_id = self._replace_recurring_occurrence_with_single_override(rid, occurrence_day, start_dt, end_dt, category, task_text)
+            else:
+                self.db.update_plan(rid, start_dt, end_dt, category, task_text, original.get("recurrence", "none"), bool(original.get("is_all_day", False)), original.get("recurrence_range_start", ""), original.get("recurrence_range_end", ""))
+        else:
+            self.db.update_session(rid, start_dt, end_dt, category, task_text)
+        self.selected_date = start_of_day(start_dt)
+        self.calendar.set_selected_date(self.selected_date)
+        self.calendar.set_focus_item(focus_source, focus_id)
+        self.refresh_all()
+        return (focus_source, focus_id)
+
     def duplicate_calendar_item(self, item: dict, start_dt: datetime, end_dt: datetime):
         if end_dt <= start_dt:
             return None
@@ -4015,7 +5137,7 @@ class MainWindow(QMainWindow):
         if source == "session":
             new_id = self.db.add_session(start_dt, end_dt, category, task_text)
         else:
-            new_id = self.db.add_plan(start_dt, end_dt, category, task_text)
+            new_id = self.db.add_plan(start_dt, end_dt, category, task_text, item.get("recurrence", "none"), bool(item.get("is_all_day", False)))
         self.selected_date = start_of_day(start_dt)
         self.calendar.set_selected_date(self.selected_date)
         self.calendar.set_focus_item(source, new_id)
@@ -4023,12 +5145,21 @@ class MainWindow(QMainWindow):
         return (source, new_id)
 
     def delete_calendar_item(self, source: str, rid: int):
+        snapshots = self._snapshot_refs_for_undo([(source, int(rid))])
         if source == "plan":
             self.db.delete_plan(int(rid))
         else:
             self.db.delete_session(int(rid))
+        self._push_deleted_items_undo(snapshots)
         self.calendar.set_focus_item(None, None)
         self.refresh_all()
+
+    def keyPressEvent(self, e):
+        if (e.modifiers() & Qt.ControlModifier) and e.key() == Qt.Key_Z:
+            self.undo_last_delete()
+            e.accept()
+            return
+        super().keyPressEvent(e)
 
     def refresh_all(self):
         items = self._items_for_selected_day()
@@ -4036,7 +5167,7 @@ class MainWindow(QMainWindow):
         self.stats.set_day_items(self.selected_date, items)
         self._refresh_range_stats()
         if hasattr(self, "today_task_card"):
-            self.today_task_card.set_tasks(start_of_day(now_local()), self._today_task_items())
+            self.today_task_card.set_tasks(start_of_day(now_local()), self._today_task_items(), mode=self.today_task_mode)
         self.calendar.update()
         self.task_card.title.setText(f"Task Details  ·  {self.selected_date.strftime('%Y-%m-%d')}")
         self._apply_dynamic_scale()
