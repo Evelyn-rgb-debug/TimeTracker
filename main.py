@@ -2229,11 +2229,6 @@ class TaskDialog(GlassDialog):
         lay.addWidget(self.txt, 1)
 
         btns = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
-        if allow_delete:
-            self.btn_delete = btns.addButton(delete_label, QDialogButtonBox.DestructiveRole)
-            self.btn_delete.clicked.connect(self._request_delete)
-        else:
-            self.btn_delete = None
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)
         lay.addWidget(btns)
