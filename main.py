@@ -1404,6 +1404,7 @@ class StatsWidget(LightGlassCard):
     SCOPE_DAY = "day"
     SCOPE_WEEK = "week"
     SCOPE_MONTH = "month"
+    FILTER_ALL = "__all__"
 
     def __init__(self, parent=None):
         super().__init__(radius=30, parent=parent)
@@ -1415,6 +1416,8 @@ class StatsWidget(LightGlassCard):
         self.summary_scope_mode = self.SCOPE_MONTH
         self.on_summary_scope_changed = None
         self.hovered_cat: str | None = None
+        self.available_categories = normalize_categories(CURRENT_CATEGORY_ORDER)
+        self.summary_category_filter = self.FILTER_ALL
         self._segment_meta: list[dict] = []
         self._ring_center = QPointF(0.0, 0.0)
         self._ring_inner_radius = 0.0
@@ -1437,6 +1440,11 @@ class StatsWidget(LightGlassCard):
         for mode, btn in self._scope_buttons.items():
             btn.setCursor(Qt.PointingHandCursor)
             btn.clicked.connect(lambda checked=False, m=mode: self.set_summary_scope_mode(m, emit=True))
+
+        self.cmb_summary_category = QComboBox(self)
+        self.cmb_summary_category.setCursor(Qt.PointingHandCursor)
+        self.cmb_summary_category.currentIndexChanged.connect(self._on_summary_category_changed)
+        self.set_available_categories(self.available_categories)
 
         self._sync_controls()
 
@@ -1463,27 +1471,86 @@ class StatsWidget(LightGlassCard):
             QPushButton:pressed{{background:rgba(255,255,255,145);}}
         """
 
+    def _summary_combo_style(self) -> str:
+        return """
+            QComboBox{
+                background:rgba(255,255,255,30);
+                color:rgba(120,128,145,210);
+                border:1px solid rgba(255,255,255,110);
+                border-radius:10px;
+                padding:1px 8px;
+                font-size:8px;
+                font-weight:1000;
+            }
+            QComboBox::drop-down{
+                border:none;
+                width:14px;
+            }
+            QComboBox::down-arrow{
+                image:none;
+                width:0px;
+                height:0px;
+            }
+            QComboBox QAbstractItemView{
+                background:rgba(255,255,255,235);
+                color:rgba(120,128,145,220);
+                border:1px solid rgba(220,225,235,220);
+                selection-background-color:rgba(230,232,238,180);
+                selection-color:rgba(95,103,120,230);
+                font-size:8px;
+                font-weight:1000;
+            }
+        """
+
+    def set_available_categories(self, categories):
+        current = str(self.summary_category_filter or self.FILTER_ALL)
+        self.available_categories = normalize_categories(categories)
+        self.cmb_summary_category.blockSignals(True)
+        self.cmb_summary_category.clear()
+        self.cmb_summary_category.addItem("All Categories", self.FILTER_ALL)
+        for cat in self.available_categories:
+            self.cmb_summary_category.addItem(cat, cat)
+        idx = self.cmb_summary_category.findData(current)
+        if idx < 0:
+            current = self.FILTER_ALL
+            idx = 0
+        self.summary_category_filter = current
+        self.cmb_summary_category.setCurrentIndex(idx)
+        self.cmb_summary_category.setStyleSheet(self._summary_combo_style())
+        self.cmb_summary_category.blockSignals(False)
+        self.update()
+
+    def _on_summary_category_changed(self, _index: int):
+        current = self.cmb_summary_category.currentData()
+        self.summary_category_filter = str(current or self.FILTER_ALL)
+        self.update()
+
+    def _active_summary_filter_value(self) -> str:
+        return str(self.summary_category_filter or self.FILTER_ALL)
+
+    def _active_summary_filter_label(self) -> str:
+        current = self._active_summary_filter_value()
+        return "All Categories" if current == self.FILTER_ALL else current
+
     def _layout_controls(self):
         margin_x = sp(self, 14)
-
-        # 标题单独占第一行，按钮放到下面一行
         title_top = sp(self, 12)
         title_h = sp(self, 24)
         top_y = title_top + title_h + sp(self, 20)
 
-        btn_h = sp(self, 22)#按钮高度
+        btn_h = sp(self, 22)
         gap = sp(self, 4)
 
-        # 尽量小一点，但保证能装下文字
         toggle_w = sp(self, 70 if self.view_mode == self.VIEW_SUMMARY else 120)
-        scope_w = sp(self, 50) #Day、Week 的宽度
-        scope_month_w = sp(self, 60) #Month 的宽度
+        scope_w = sp(self, 50)
+        scope_month_w = sp(self, 60)
 
-        right_x = self.width() - margin_x - toggle_w
-        self.btn_summary_toggle.setGeometry(right_x, top_y, toggle_w, btn_h)
+        right_edge = self.width() - margin_x
+        toggle_x = right_edge - toggle_w
+        self.btn_summary_toggle.setGeometry(toggle_x, top_y, toggle_w, btn_h)
 
-        x = right_x - gap
         if self.view_mode == self.VIEW_SUMMARY:
+            x = toggle_x - gap
             for mode in (self.SCOPE_MONTH, self.SCOPE_WEEK, self.SCOPE_DAY):
                 btn = self._scope_buttons[mode]
                 w = scope_month_w if mode == self.SCOPE_MONTH else scope_w
@@ -1492,7 +1559,9 @@ class StatsWidget(LightGlassCard):
                 x -= gap
             self._controls_left = x + gap
         else:
-            self._controls_left = right_x
+            self._controls_left = toggle_x
+
+        self.cmb_summary_category.setGeometry(0, 0, 0, 0)
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
@@ -1510,6 +1579,10 @@ class StatsWidget(LightGlassCard):
         summary_open = self.view_mode == self.VIEW_SUMMARY
         self.btn_summary_toggle.setText("Back" if summary_open else "Work Summary")
         self.btn_summary_toggle.setStyleSheet(self._compact_button_style(active=summary_open))
+        self.cmb_summary_category.setVisible(summary_open)
+        self.cmb_summary_category.setStyleSheet(self._summary_combo_style())
+        if not summary_open:
+            self.cmb_summary_category.setGeometry(0, 0, 0, 0)
         for mode, btn in self._scope_buttons.items():
             btn.setVisible(summary_open)
             btn.setStyleSheet(self._compact_button_style(active=(summary_open and mode == self.summary_scope_mode)))
@@ -1550,6 +1623,56 @@ class StatsWidget(LightGlassCard):
             return f"{st.strftime('%Y-%m-%d')}  ~  {ed.strftime('%m-%d')}"
         return month_start(self.summary_anchor_date).strftime("%Y-%m")
 
+    def _summary_scope_range(self) -> tuple[datetime, datetime]:
+        if self.summary_scope_mode == self.SCOPE_DAY:
+            return start_of_day(self.summary_anchor_date), end_of_day(self.summary_anchor_date)
+        if self.summary_scope_mode == self.SCOPE_WEEK:
+            st = week_start(self.summary_anchor_date)
+            return st, st + timedelta(days=6, hours=23, minutes=59, seconds=59)
+        st = month_start(self.summary_anchor_date)
+        return st, add_months(st, 1) - timedelta(seconds=1)
+
+    def _summary_trend_series(self) -> list[dict]:
+        range_start, range_end = self._summary_scope_range()
+        filter_value = self._active_summary_filter_value()
+        days = []
+        if self.summary_scope_mode == self.SCOPE_DAY:
+            days = [start_of_day(self.summary_anchor_date)]
+        elif self.summary_scope_mode == self.SCOPE_WEEK:
+            st = week_start(self.summary_anchor_date)
+            days = [st + timedelta(days=i) for i in range(7)]
+        else:
+            st = month_start(self.summary_anchor_date)
+            day_count = (add_months(st, 1) - st).days
+            days = [st + timedelta(days=i) for i in range(day_count)]
+
+        totals_by_day = {day.strftime('%Y-%m-%d'): 0 for day in days}
+        for item in self.summary_items:
+            cat = normalize_category(item.get("category", "Other"))
+            if filter_value != self.FILTER_ALL and cat != filter_value:
+                continue
+            for piece in split_item_by_day(item, range_start, range_end):
+                key = day_key_from(piece.get("start", ""))
+                if key in totals_by_day:
+                    totals_by_day[key] += max(0, int(piece.get("duration_sec", 0) or 0))
+
+        out = []
+        for day in days:
+            key = day.strftime('%Y-%m-%d')
+            if self.summary_scope_mode == self.SCOPE_DAY:
+                label = day.strftime('%m-%d')
+            elif self.summary_scope_mode == self.SCOPE_WEEK:
+                label = day.strftime('%a')[:2]
+            else:
+                label = str(day.day)
+            out.append({
+                "date": day,
+                "key": key,
+                "label": label,
+                "sec": totals_by_day.get(key, 0),
+            })
+        return out
+
     def _active_title(self) -> str:
         if self.view_mode == self.VIEW_SUMMARY:
             return "Work Summary"
@@ -1560,133 +1683,33 @@ class StatsWidget(LightGlassCard):
 
     def _default_center_sub(self) -> str:
         if self.view_mode == self.VIEW_SUMMARY:
-            return ""
+            return self._summary_period_text()
         return "Recorded Today"
 
     @staticmethod
-    def _norm_angle(deg_value: float) -> float:
-        return deg_value % 360.0
-    @staticmethod
-    def _angle_delta(a: float, b: float) -> float:
-        return abs((a - b + 180.0) % 360.0 - 180.0)
-
-    def _distance_to_arc_centerline(self, point: QPointF, seg: dict) -> float:
-        px = float(point.x())
-        py = float(point.y())
-        cx = float(self._ring_center.x())
-        cy = float(self._ring_center.y())
-        radius = float(seg["radius"])
-
-        dx = px - cx
-        dy = py - cy
-        dist = math.hypot(dx, dy)
-
-        return abs(dist - radius)
-    def _angle_in_span(self, angle: float, start_deg: float, extent_deg: float) -> bool:
-        if extent_deg >= 360.0:
-            return True
-        a = self._norm_angle(angle)
-        s = self._norm_angle(start_deg)
-        e = self._norm_angle(start_deg + extent_deg)
-        if s <= e:
-            return s <= a <= e
-        return a >= s or a <= e
-
-    def _distance_to_segment_centerline(self, point: QPointF, seg: dict) -> float:
-        px = float(point.x())
-        py = float(point.y())
-        cx = float(self._ring_center.x())
-        cy = float(self._ring_center.y())
-        radius = float(seg.get("radius", max(1.0, (self._ring_inner_radius + self._ring_outer_radius) * 0.5)))
-        start_deg = float(seg["start_deg"])
-        extent_deg = float(seg["extent_deg"])
-
-        dx = px - cx
-        dy = py - cy
-        dist = math.hypot(dx, dy)
-        angle = self._norm_angle(math.degrees(math.atan2(dy, dx)))
-
-        if self._angle_in_span(angle, start_deg, extent_deg):
-            return abs(dist - radius)
-
-        end_deg = start_deg + extent_deg
-        best = float("inf")
-        for a in (start_deg, end_deg):
-            rad = math.radians(a)
-            ex = cx + radius * math.cos(rad)
-            ey = cy + radius * math.sin(rad)
-            best = min(best, math.hypot(px - ex, py - ey))
-        return best
+    def _distance_to_arc_centerline(point: QPointF, center: QPointF, radius: float) -> float:
+        dx = float(point.x() - center.x())
+        dy = float(point.y() - center.y())
+        return abs(math.hypot(dx, dy) - radius)
 
     def _cat_at_pos(self, pos) -> str | None:
         if not self._segment_meta:
             return None
-
-        dx = float(pos.x() - self._ring_center.x())
-        dy = float(pos.y() - self._ring_center.y())
-        dist = math.hypot(dx, dy)
-
-        # 只让“接近真正色环”的位置可命中，不把外面整圈发光都算进去
-        ring_mid = (self._ring_inner_radius + self._ring_outer_radius) * 0.5
-        radial_tol = 7.5
-        if abs(dist - ring_mid) > radial_tol:
-            return None
-
-        # 关键：Qt 圆弧坐标系要用 -dy，不能直接 atan2(dy, dx)
-        angle = self._norm_angle(math.degrees(math.atan2(-dy, dx)))
-
-        best_cat = None
-        best_score = None
-
-        for seg in self._segment_meta:
-            extent = max(0.2, float(seg["extent_deg"]))
-            center = self._norm_angle(seg["start_deg"] + extent * 0.5)
-
-            # 给小扇区一点额外容差，但不让大扇区无限抢占
-            angular_tol = min(6.0, 18.0 / extent)
-            half_span = extent * 0.5 + angular_tol
-
-            ang_diff = self._angle_delta(angle, center)
-            if ang_diff <= half_span:
-                radial_diff = abs(dist - ring_mid)
-
-                # 越靠近该扇区中心越优先；小扇区给一点点轻微优先
-                score = ang_diff * 2.0 + radial_diff * 0.35 - min(1.2, 10.0 / extent)
-
-                if best_score is None or score < best_score:
-                    best_score = score
-                    best_cat = seg["cat"]
-
-        return best_cat
-
-    def _cat_at_pos(self, pos) -> str | None:
-        if not self._segment_meta:
-            return None
-
         point = QPointF(float(pos.x()), float(pos.y()))
-
         best_seg = None
         best_score = None
-
+        ring_mid = (self._ring_inner_radius + self._ring_outer_radius) * 0.5
         for seg in self._segment_meta:
             hit_path = seg.get("hit_path")
-            if hit_path is None:
+            if hit_path is None or not hit_path.contains(point):
                 continue
-            if not hit_path.contains(point):
-                continue
-
-            extent = max(0.2, float(seg["extent_deg"]))
-            dist_score = self._distance_to_arc_centerline(point, seg)
-
-            # 小色块给一点轻微优先，但不要过强
-            tiny_bonus = min(1.2, 8.0 / extent)
-
-            score = dist_score - tiny_bonus
+            extent = max(0.2, float(seg.get("extent_deg", 0.2)))
+            dist_score = self._distance_to_arc_centerline(point, self._ring_center, ring_mid)
+            score = dist_score - min(1.2, 8.0 / extent)
             if best_score is None or score < best_score:
                 best_score = score
                 best_seg = seg
-
-        return None if best_seg is None else best_seg["cat"]
+        return None if best_seg is None else best_seg.get("cat")
 
     def mouseMoveEvent(self, e):
         hovered = self._cat_at_pos(e.position())
@@ -1701,6 +1724,130 @@ class StatsWidget(LightGlassCard):
             self.update()
         super().leaveEvent(e)
 
+    def _summary_bar_color(self, index: int, total_count: int) -> QColor:
+        current = self._active_summary_filter_value()
+        if current != self.FILTER_ALL:
+            return color_for_category(current)
+        if total_count <= 1:
+            return blend(MINT, PURPLE, 0.5)
+        return blend(MINT, PURPLE, index / max(1, total_count - 1))
+
+    def _place_summary_combo_in_trend(self, panel: QRectF):
+        if self.view_mode != self.VIEW_SUMMARY:
+            self.cmb_summary_category.setGeometry(0, 0, 0, 0)
+            return
+        combo_h = sp(self, 22)
+        combo_w = int(min(sp(self, 150), max(sp(self, 110), panel.width() * 0.34)))
+        combo_x = int(round(panel.left() + 12))
+        combo_y = int(round(panel.top() + 7))
+        self.cmb_summary_category.setGeometry(combo_x, combo_y, combo_w, combo_h)
+        self.cmb_summary_category.raise_()
+
+    def _draw_summary_trend(self, p: QPainter, rect: QRectF):
+        series = self._summary_trend_series()
+        filter_label = self._active_summary_filter_label()
+        total_sec = sum(int(item.get("sec", 0) or 0) for item in series)
+        peak_sec = max([int(item.get("sec", 0) or 0) for item in series] or [0])
+        avg_sec = int(round(total_sec / max(1, len(series)))) if series else 0
+
+        panel = QRectF(rect)
+        p.setPen(QPen(QColor(255, 255, 255, ga(self, 160)), 1.0))
+        p.setBrush(QColor(255, 255, 255, ga(self, 38)))
+        p.drawRoundedRect(panel, 18, 18)
+
+        self._place_summary_combo_in_trend(panel)
+
+        header_rect = QRectF(panel.left() + 12, panel.top() + 6, panel.width() - 24, 16)
+        combo_rect = QRectF(self.cmb_summary_category.geometry())
+        header_left = max(panel.left() + 12, combo_rect.right() + 10)
+        if header_left < header_rect.right() - 40:
+            p.setPen(QColor(SUBTEXT.red(), SUBTEXT.green(), SUBTEXT.blue(), 170))
+            p.setFont(ui_font(self, 7.8, QFont.Medium))
+            p.drawText(QRectF(header_left, header_rect.top(), max(0.0, header_rect.right() - header_left), header_rect.height()), Qt.AlignLeft | Qt.AlignVCenter, "Trend")
+        p.setPen(QColor(SUBTEXT.red(), SUBTEXT.green(), SUBTEXT.blue(), 200))
+        p.setFont(ui_font(self, 7.9, QFont.Medium))
+        p.drawText(header_rect, Qt.AlignRight | Qt.AlignVCenter, f"Peak {fmt_hms(peak_sec)}")
+
+        meta_rect = QRectF(panel.left() + 12, panel.top() + 21, panel.width() - 24, 14)
+        p.setPen(QColor(SUBTEXT.red(), SUBTEXT.green(), SUBTEXT.blue(), 188))
+        p.setFont(ui_font(self, 7.4, QFont.Medium))
+        #计算avg, peak, total时长
+        #p.drawText(meta_rect, Qt.AlignLeft | Qt.AlignVCenter, f"Total {fmt_hms(total_sec)}   ·   Avg {fmt_hms(avg_sec)}")
+        
+        chart_rect = panel.adjusted(12, 39, -12, -14)
+        if chart_rect.width() <= 20 or chart_rect.height() <= 20:
+            return
+
+        baseline_y = chart_rect.bottom() - 12
+        usable_h = max(10.0, chart_rect.height() - 18)
+
+        p.setPen(QPen(QColor(255, 255, 255, ga(self, 110)), 1.0))
+        for t in (0.0, 0.5, 1.0):
+            y = baseline_y - usable_h * t
+            p.drawLine(QPointF(chart_rect.left(), y), QPointF(chart_rect.right(), y))
+
+        if not series:
+            p.setPen(QColor(TEXT.red(), TEXT.green(), TEXT.blue(), 150))
+            p.setFont(ui_font(self, 8.6, QFont.Bold))
+            p.drawText(chart_rect, Qt.AlignCenter, "No trend data")
+            return
+
+        max_sec = max(1, max(int(item.get("sec", 0) or 0) for item in series))
+        count = len(series)
+        if count <= 7:
+            gap = 4.0
+        elif count <= 14:
+            gap = 2.5
+        else:
+            gap = 1.5
+        bar_w = max(3.0, (chart_rect.width() - gap * (count - 1)) / max(1, count))
+
+        label_stride = 1
+        if self.summary_scope_mode == self.SCOPE_MONTH:
+            if count >= 31:
+                label_stride = 5
+            elif count >= 28:
+                label_stride = 4
+
+        for idx, item in enumerate(series):
+            sec = max(0, int(item.get("sec", 0) or 0))
+            ratio = sec / max_sec if max_sec else 0.0
+            x = chart_rect.left() + idx * (bar_w + gap)
+            bar_h = max(2.5 if sec > 0 else 0.0, usable_h * ratio)
+            y = baseline_y - bar_h
+            bar_rect = QRectF(x, y, bar_w, bar_h)
+            col = self._summary_bar_color(idx, count)
+
+            fill = QLinearGradient(bar_rect.topLeft(), bar_rect.bottomLeft())
+            fill.setColorAt(0.0, QColor(255, 255, 255, 130 if sec == peak_sec and sec > 0 else 86))
+            fill.setColorAt(0.24, QColor(col.red(), col.green(), col.blue(), 205 if sec > 0 else 90))
+            fill.setColorAt(1.0, QColor(col.red(), col.green(), col.blue(), 150 if sec > 0 else 72))
+            p.setPen(Qt.NoPen)
+            p.setBrush(fill)
+            p.drawRoundedRect(bar_rect, min(4.0, bar_w / 2.0), min(4.0, bar_w / 2.0))
+
+            if sec == peak_sec and sec > 0:
+                p.setPen(QPen(QColor(255, 255, 255, ga(self, 185)), 1.0))
+                p.setBrush(Qt.NoBrush)
+                p.drawRoundedRect(bar_rect.adjusted(0.5, 0.5, -0.5, -0.5), min(4.0, bar_w / 2.0), min(4.0, bar_w / 2.0))
+
+            show_label = (count <= 10) or (idx % label_stride == 0) or (idx == count - 1)
+            if show_label:
+                p.setPen(QColor(SUBTEXT.red(), SUBTEXT.green(), SUBTEXT.blue(), 186))
+                p.setFont(ui_font(self, 7.1 if count > 14 else 7.6, QFont.Medium))
+                label_rect = QRectF(x - 4, baseline_y + 2, bar_w + 8, 12)
+                p.drawText(label_rect, Qt.AlignHCenter | Qt.AlignTop, str(item.get("label", "")))
+
+        p.setPen(QColor(SUBTEXT.red(), SUBTEXT.green(), SUBTEXT.blue(), 164))
+        p.setFont(ui_font(self, 7.2, QFont.Medium))
+        #PEAK
+        #p.drawText(QRectF(chart_rect.left(), chart_rect.top() - 2, chart_rect.width(), 10), Qt.AlignRight | Qt.AlignVCenter, fmt_hms(max_sec))
+
+        if peak_sec <= 0:
+            p.setPen(QColor(TEXT.red(), TEXT.green(), TEXT.blue(), 145))
+            p.setFont(ui_font(self, 8.2, QFont.Bold))
+            p.drawText(chart_rect, Qt.AlignCenter, f"No records for {filter_label}")
+
     def paintEvent(self, e):
         super().paintEvent(e)
         p = QPainter(self)
@@ -1714,10 +1861,24 @@ class StatsWidget(LightGlassCard):
 
         active_items = self._active_items()
         ordered, total, totals = aggregate_category_totals(active_items)
+        summary_open = self.view_mode == self.VIEW_SUMMARY
+
+        summary_trend_rect = None
+        control_buttons = [self.btn_summary_toggle] + [btn for btn in self._scope_buttons.values() if btn.isVisible()]
+        controls_bottom = max([btn.geometry().bottom() for btn in control_buttons if btn.isVisible()] or [int(r.top())])
 
         cx = r.center().x()
-        cy = r.top() + r.height() * 0.42
-        radius = min(r.width(), r.height()) * 0.24
+        if summary_open:
+            trend_h = min(max(90.0, r.height() * 0.40), 120.0)
+            summary_trend_rect = QRectF(r.left() + 8, r.bottom() - trend_h - 2, r.width() - 16, trend_h)
+            ring_top = max(r.top() + 34.0, float(controls_bottom + sp(self, 10)))
+            ring_bottom = summary_trend_rect.top() - sp(self, 10)
+            available_h = max(84.0, ring_bottom - ring_top)
+            cy = ring_top + available_h * 0.5
+            radius = min(r.width() * 0.22, available_h * 0.44)
+        else:
+            cy = r.top() + r.height() * 0.42
+            radius = min(r.width(), r.height()) * 0.24
         arc_rect = QRectF(cx - radius, cy - radius, radius * 2, radius * 2)
         self._ring_center = QPointF(cx, cy)
         self._ring_inner_radius = radius - 3
@@ -1730,7 +1891,8 @@ class StatsWidget(LightGlassCard):
         if total <= 0:
             p.setPen(QColor(TEXT.red(), TEXT.green(), TEXT.blue(), 140))
             p.setFont(ui_font(self, 10, QFont.Bold))
-            p.drawText(QRectF(cx - 110, cy - 10, 220, 20), Qt.AlignCenter, "No Records")
+            empty_rect = QRectF(r.left(), r.top() + 38, r.width(), r.height() - 38)
+            p.drawText(empty_rect, Qt.AlignCenter, "No Records")
             return
 
         start_deg = -90.0
@@ -1738,30 +1900,22 @@ class StatsWidget(LightGlassCard):
             extent = 360.0 * sec / total
             col = color_for_category(cat)
             hovered = cat == self.hovered_cat
-
-            # 视觉绘制仍然保留 glow
             draw_rect = arc_rect.adjusted(-4, -4, 4, 4) if hovered else arc_rect
             halo_width = 24 if hovered else 18
             stroke_width = 10 if hovered else 7
 
             p.setPen(QPen(QColor(col.red(), col.green(), col.blue(), 70 if hovered else 46), halo_width, Qt.SolidLine, Qt.RoundCap))
             p.drawArc(draw_rect, int(start_deg * 16), int(extent * 16))
-
             p.setPen(QPen(col, stroke_width, Qt.SolidLine, Qt.RoundCap))
             p.drawArc(draw_rect, int(start_deg * 16), int(extent * 16))
 
-            # 命中路径只围绕“真正的实心圆环”，不要用 glow 宽度
             hit_arc = QPainterPath()
             hit_arc.arcMoveTo(arc_rect, start_deg)
             hit_arc.arcTo(arc_rect, start_deg, extent)
-
             stroker = QPainterPathStroker()
             stroker.setCapStyle(Qt.RoundCap)
             stroker.setJoinStyle(Qt.RoundJoin)
-
-            # 命中宽度只比实心环略宽一点，仍然贴着真正圆环
-            hit_width = 12.0 if extent >= 14.0 else 16.0
-            stroker.setWidth(hit_width)
+            stroker.setWidth(12.0 if extent >= 14.0 else 16.0)
 
             self._segment_meta.append({
                 "cat": cat,
@@ -1772,7 +1926,6 @@ class StatsWidget(LightGlassCard):
                 "radius": radius,
                 "hit_path": stroker.createStroke(hit_arc),
             })
-
             start_deg += extent
 
         p.setPen(QPen(QColor(255, 255, 255, 128), 2, Qt.SolidLine, Qt.RoundCap))
@@ -1801,6 +1954,13 @@ class StatsWidget(LightGlassCard):
             p.setPen(QColor(SUBTEXT.red(), SUBTEXT.green(), SUBTEXT.blue(), 190))
             p.setFont(ui_font(self, 8.8, QFont.Medium))
             p.drawText(QRectF(cx - 110, cy + 8, 220, 18), Qt.AlignCenter, center_sub)
+
+        if summary_open:
+            if summary_trend_rect is None:
+                chart_top = cy + radius + sp(self, 12)
+                summary_trend_rect = QRectF(r.left() + 8, chart_top, r.width() - 16, max(74.0, r.bottom() - chart_top - 4))
+            self._draw_summary_trend(p, summary_trend_rect)
+            return
 
         y = int(cy + radius + 14)
         x = r.left() + 10
@@ -2865,6 +3025,10 @@ class CalendarCanvas(LightGlassCard):
         self._resize_drag_end: datetime | None = None
         self._resize_drag_rect: QRectF | None = None
         self._resize_hover_edge: str | None = None
+        self.snap_threshold_minutes = 3
+        self._overlap_cycle_signatures: list[tuple[str, int, str]] = []
+        self._overlap_cycle_index = -1
+        self._overlap_cycle_anchor = QPoint(-10000, -10000)
         self.setMouseTracking(True)
 
     def set_sessions_callback(self, fn):
@@ -2984,6 +3148,55 @@ class CalendarCanvas(LightGlassCard):
             and int(item.get("id", -1)) == int(self.focus_item_id)
         )
 
+    def _hit_signature(self, hit: dict | None) -> tuple[str, int, str]:
+        if hit is None:
+            return ("", -1, "")
+        source = str(hit.get("source", ""))
+        try:
+            item_id = int(hit.get("id", -1))
+        except Exception:
+            item_id = -1
+        occurrence = str(hit.get("occurrence_start") or hit.get("start") or "")
+        return (source, item_id, occurrence)
+
+    def _hits_at_pos(self, pos) -> list[dict]:
+        hits: list[dict] = []
+        for hit in self._item_hits:
+            rect = hit.get("rect")
+            if rect is not None and rect.contains(pos):
+                hits.append(hit)
+        return hits
+
+    def _pick_cycled_hit_at(self, pos) -> dict | None:
+        hits = self._hits_at_pos(pos)
+        if not hits:
+            self._overlap_cycle_signatures = []
+            self._overlap_cycle_index = -1
+            self._overlap_cycle_anchor = QPoint(-10000, -10000)
+            return None
+
+        signatures = [self._hit_signature(hit) for hit in hits]
+        anchor = pos.toPoint() if hasattr(pos, "toPoint") else QPoint(int(pos.x()), int(pos.y()))
+        same_stack = (
+            signatures == self._overlap_cycle_signatures
+            and abs(anchor.x() - self._overlap_cycle_anchor.x()) <= 4
+            and abs(anchor.y() - self._overlap_cycle_anchor.y()) <= 4
+        )
+
+        if not same_stack:
+            focused_index = -1
+            for idx, hit in enumerate(hits):
+                if self._is_focused_item(hit):
+                    focused_index = idx
+            self._overlap_cycle_signatures = signatures
+            self._overlap_cycle_anchor = anchor
+            self._overlap_cycle_index = focused_index if focused_index >= 0 else len(hits) - 1
+            return hits[self._overlap_cycle_index]
+
+        self._overlap_cycle_index = (self._overlap_cycle_index - 1) % len(hits)
+        self._overlap_cycle_anchor = anchor
+        return hits[self._overlap_cycle_index]
+
     def _hit_item_at(self, pos):
         for hit in reversed(self._item_hits):
             rect = hit.get("rect")
@@ -3029,6 +3242,47 @@ class CalendarCanvas(LightGlassCard):
         mm = total_minutes % 60
         return dt.replace(hour=hh, minute=mm, second=0, microsecond=0)
 
+    def _snap_item_identity(self, item: dict | None) -> tuple[str, int, str]:
+        if not item:
+            return ("", -1, "")
+        source = str(item.get("source", ""))
+        try:
+            rid = int(item.get("id", -1))
+        except Exception:
+            rid = -1
+        occurrence = str(item.get("occurrence_start") or item.get("start") or "")
+        return (source, rid, occurrence)
+
+    def _snap_candidate_datetimes(self, target_day: datetime, moving_item: dict | None = None) -> list[datetime]:
+        day_start = start_of_day(target_day)
+        day_end = day_start + timedelta(days=1)
+        exclude_key = self._snap_item_identity(moving_item)
+        candidates: list[datetime] = []
+        for other in self._combined_items_in_range(day_start, day_end):
+            if self._snap_item_identity(other) == exclude_key:
+                continue
+            for key in ("start", "end"):
+                try:
+                    candidates.append(str_to_dt(other[key]))
+                except Exception:
+                    pass
+        return candidates
+
+    def _snap_datetime_to_neighbors(self, moving_dt: datetime, target_day: datetime, moving_item: dict | None = None) -> datetime:
+        threshold = timedelta(minutes=max(0, int(self.snap_threshold_minutes or 0)))
+        if threshold <= timedelta(0):
+            return moving_dt
+        best_dt = moving_dt
+        best_delta: timedelta | None = None
+        for candidate in self._snap_candidate_datetimes(target_day, moving_item):
+            delta = abs(candidate - moving_dt)
+            if delta > threshold:
+                continue
+            if best_delta is None or delta < best_delta:
+                best_delta = delta
+                best_dt = candidate
+        return best_dt
+
     def _proposal_from_resize_hit(self, pos, item: dict, edge: str):
         rect = item.get("rect")
         if rect is None or self._grid_rect is None:
@@ -3037,6 +3291,7 @@ class CalendarCanvas(LightGlassCard):
         true_start = str_to_dt(item.get("true_start", item.get("start")))
         true_end = str_to_dt(item.get("true_end", item.get("end")))
         moving_dt = self._snapped_datetime_from_position(pos, piece_start)
+        moving_dt = self._snap_datetime_to_neighbors(moving_dt, piece_start, item)
         min_delta = timedelta(minutes=1)
 
         if edge == "start":
@@ -3100,8 +3355,20 @@ class CalendarCanvas(LightGlassCard):
         start_dt, _ = self._proposal_from_position(pos, base_dt)
         duration_sec = max(60, int(item.get("duration_sec", 0) or 0))
         end_dt = start_dt + timedelta(seconds=duration_sec)
-        ss = str_to_dt(item["start"])
-        ee = str_to_dt(item["end"])
+
+        snapped_start = self._snap_datetime_to_neighbors(start_dt, start_dt, item)
+        snapped_end = snapped_start + timedelta(seconds=duration_sec)
+
+        end_snap_candidate = self._snap_datetime_to_neighbors(end_dt, start_dt, item)
+        start_delta = abs(snapped_start - start_dt)
+        end_delta = abs(end_snap_candidate - end_dt)
+        if end_delta < start_delta and end_snap_candidate != end_dt:
+            snapped_end = end_snap_candidate
+            snapped_start = snapped_end - timedelta(seconds=duration_sec)
+
+        start_dt = snapped_start
+        end_dt = snapped_end
+
         start_hour, end_hour = hours_in_day_span(start_dt, end_dt)
         view_end = self.view_start_hour + self.visible_hours
         col_index = (start_of_day(start_dt) - week_start(self.selected_date)).days
@@ -3158,7 +3425,8 @@ class CalendarCanvas(LightGlassCard):
                 if self.on_pick_month_year:
                     self.on_pick_month_year(self.selected_date)
                 return
-            edge_hit, edge = self._edge_hit_for_item(pos)
+            direct_hit = self._pick_cycled_hit_at(pos)
+            edge_hit, edge = self._edge_hit_for_item(pos, hit=direct_hit)
             if edge_hit is not None:
                 self.setFocus(Qt.MouseFocusReason)
                 self.set_focus_item(edge_hit.get("source"), edge_hit.get("id"))
@@ -3182,6 +3450,9 @@ class CalendarCanvas(LightGlassCard):
                     self._duplicate_drag_rect = None
                 e.accept()
                 return
+            self._overlap_cycle_signatures = []
+            self._overlap_cycle_index = -1
+            self._overlap_cycle_anchor = QPoint(-10000, -10000)
             dt = self._date_at_position(pos)
             if dt:
                 self.setFocus(Qt.MouseFocusReason)
@@ -3561,7 +3832,8 @@ class CalendarCanvas(LightGlassCard):
         for i in range(7):
             dt = st + timedelta(days=i)
             items = by_day.get(dt, [])
-            for s in items:
+            ordered_items = [s for s in items if not self._is_focused_item(s)] + [s for s in items if self._is_focused_item(s)]
+            for s in ordered_items:
                 if self._is_all_day_item(s):
                     continue
                 ss = str_to_dt(s["start"])
@@ -3587,7 +3859,7 @@ class CalendarCanvas(LightGlassCard):
                 else:
                     p.setPen(QPen(QColor(255, 255, 255, 190 if focused else 145), 1.8 if focused else 1.0))
                     p.setBrush(QColor(col.red(), col.green(), col.blue(), 112 if focused else 98))
-                p.drawRoundedRect(rect, 12, 12)
+                p.drawRoundedRect(rect, 8, 8)
                 show_detail = self._calendar_item_show_detail(rect, mode='week', include_category=False)
                 p.setPen(QColor(TEXT.red(), TEXT.green(), TEXT.blue(), 225))
                 p.setFont(ui_font(self, 9, QFont.Bold))
@@ -3606,7 +3878,7 @@ class CalendarCanvas(LightGlassCard):
             rect = self._duplicate_drag_rect
             p.setPen(QPen(QColor(255, 255, 255, 235), 2.0, Qt.DashLine))
             p.setBrush(QColor(col.red(), col.green(), col.blue(), 42))
-            p.drawRoundedRect(rect, 12, 12)
+            p.drawRoundedRect(rect, 8, 8)
             show_detail = self._calendar_item_show_detail(rect, mode='week', include_category=False)
             p.setPen(QColor(TEXT.red(), TEXT.green(), TEXT.blue(), 220))
             p.setFont(ui_font(self, 9, QFont.Bold))
@@ -3621,7 +3893,7 @@ class CalendarCanvas(LightGlassCard):
             rect = self._resize_drag_rect
             p.setPen(QPen(QColor(255, 255, 255, 240), 2.0, Qt.DashLine))
             p.setBrush(QColor(col.red(), col.green(), col.blue(), 52))
-            p.drawRoundedRect(rect, 12, 12)
+            p.drawRoundedRect(rect, 8, 8)
             show_detail = self._calendar_item_show_detail(rect, mode='week', include_category=False)
             p.setPen(QColor(TEXT.red(), TEXT.green(), TEXT.blue(), 220))
             p.setFont(ui_font(self, 9, QFont.Bold))
@@ -3669,7 +3941,8 @@ class CalendarCanvas(LightGlassCard):
             p.setPen(QPen(QColor(TEXT.red(), TEXT.green(), TEXT.blue(), 36), 1))
 
         view_end = self.view_start_hour + self.visible_hours
-        for s in sessions:
+        ordered_sessions = [s for s in sessions if not self._is_focused_item(s)] + [s for s in sessions if self._is_focused_item(s)]
+        for s in ordered_sessions:
             if self._is_all_day_item(s):
                 continue
             ss = str_to_dt(s["start"])
@@ -3702,7 +3975,7 @@ class CalendarCanvas(LightGlassCard):
             else:
                 p.setPen(QPen(QColor(255, 255, 255, 190 if focused else 150), 1.8 if focused else 1.1))
                 p.setBrush(QColor(col.red(), col.green(), col.blue(), 108 if focused else 92))
-            p.drawRoundedRect(rect, 12, 12)
+            p.drawRoundedRect(rect, 8, 8)
             p.setBrush(col)
             p.setPen(Qt.NoPen)
             p.drawRoundedRect(QRectF(rect.left() + 8, rect.top() + 8, 4, rect.height() - 16), 2, 2)
@@ -3724,7 +3997,7 @@ class CalendarCanvas(LightGlassCard):
             rect = self._resize_drag_rect
             p.setPen(QPen(QColor(255, 255, 255, 240), 2.0, Qt.DashLine))
             p.setBrush(QColor(col.red(), col.green(), col.blue(), 52))
-            p.drawRoundedRect(rect, 12, 12)
+            p.drawRoundedRect(rect, 8, 8)
             show_detail = self._calendar_item_show_detail(rect, mode='day', include_category=True)
             p.setPen(QColor(TEXT.red(), TEXT.green(), TEXT.blue(), 220))
             p.setFont(ui_font(self, 11, QFont.Bold))
@@ -4157,6 +4430,8 @@ class MainWindow(QMainWindow):
     def apply_category_settings(self, categories, persist: bool = True):
         self.categories = normalize_categories(categories)
         rebuild_category_colors(self.categories)
+        if hasattr(self, "stats"):
+            self.stats.set_available_categories(self.categories)
         if persist:
             self.db.set_state("categories", json.dumps(self.categories, ensure_ascii=False))
         self.refresh_all()
@@ -4384,6 +4659,7 @@ class MainWindow(QMainWindow):
         top_row.addLayout(stats_col, 1)
 
         self.stats = StatsWidget()
+        self.stats.set_available_categories(self.categories)
         self.stats.set_summary_scope_mode(self.range_stats_scope_mode, emit=False)
         self.stats.on_summary_scope_changed = self._on_range_stats_scope_changed
         stats_col.addWidget(self.stats, 1)
