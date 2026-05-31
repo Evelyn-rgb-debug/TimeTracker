@@ -1,0 +1,2 @@
+onedir和onefile是一样的，只是打包格式不同，有些宝宝说exe运行不了再试zip噢！
+onefile可以的话，zip可以删除的~
