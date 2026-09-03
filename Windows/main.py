@@ -61,7 +61,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-APP_NAME = "Time Tracker :)"
+APP_VERSION = "2026.09.03.1"
+APP_NAME = f"Time Tracker :) v{APP_VERSION}"
 DEFAULT_CATEGORIES = ["Work", "Study", "Meal", "Fun", "Commute", "Exercise", "Rest", "Other"]
 DEFAULT_TASK_PLACEHOLDER = "(No details)"
 CURRENT_CATEGORY_ORDER: list[str] = DEFAULT_CATEGORIES[:]
@@ -491,6 +492,8 @@ def is_all_day_span(start_dt: datetime, end_dt: datetime) -> bool:
 def default_recurrence_range_end(rule: str, start_dt: datetime) -> datetime:
     base = start_of_day(start_dt)
     rule = str(rule or "").strip().lower()
+    if rule == "daily":
+        return base + timedelta(days=365)
     if rule == "weekly":
         return base + timedelta(days=365)
     if rule == "monthly":
@@ -510,6 +513,8 @@ def recurrence_matches(rule: str, anchor_start: datetime, target_day: datetime) 
     if target_day < anchor_day:
         return False
 
+    if rule == 'daily':
+        return True
     if rule == 'weekly':
         return anchor_day.weekday() == target_day.weekday()
     if rule == 'monthly':
@@ -591,7 +596,7 @@ def iter_plan_occurrences(plan_row: dict, range_start: datetime, range_end: date
     end_day = min(start_of_day(range_end), recur_range_end)
     while cursor_day <= end_day:
         if recurrence_matches(recurrence, base_start, cursor_day):
-            if recurrence == 'weekly':
+            if recurrence in {'daily', 'weekly'}:
                 occ_start = cursor_day.replace(hour=base_start.hour, minute=base_start.minute, second=base_start.second, microsecond=0)
             elif recurrence == 'monthly':
                 occ_start = safe_add_months_preserve_day(base_start, (cursor_day.year - base_start.year) * 12 + (cursor_day.month - base_start.month))
@@ -2444,7 +2449,7 @@ class TaskDialog(GlassDialog):
 
 class PlanDialog(GlassDialog):
     TIME_OPTIONS = [f"{h:02d}:{m:02d}" for h in range(24) for m in (0, 15, 30, 45)]
-    RECURRENCE_OPTIONS = [("None", "none"), ("Every Week", "weekly"), ("Every Month", "monthly"), ("Every Year", "yearly")]
+    RECURRENCE_OPTIONS = [("None", "none"), ("Every Day", "daily"), ("Every Week", "weekly"), ("Every Month", "monthly"), ("Every Year", "yearly")]
 
     def __init__(self, parent, start_dt: datetime, end_dt: datetime, categories, preset_cat=None, preset_task=None, title="Plan Task", preset_recurrence: str = "none", preset_all_day: bool = False, preset_recurrence_range_start: str = "", preset_recurrence_range_end: str = "", allow_delete: bool = False, delete_label: str = "Delete"):
         super().__init__(parent)
@@ -3139,6 +3144,8 @@ class CalendarCanvas(LightGlassCard):
                 return "All day · monthly"
             if recur == "weekly":
                 return "All day · weekly"
+            if recur == "daily":
+                return "All day · daily"
             return "All day"
         return f"{ss.strftime('%H:%M')}-{ee.strftime('%H:%M')}"
 
